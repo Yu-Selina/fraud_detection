@@ -180,6 +180,19 @@ class clientMyMethod(clientAVG):
                     dist_online_loss, dist_offline_loss = self.compute_distillation_loss(online_output,offline_output,last_online_output,last_offline_output,y)
 
                     # —— EDIT —— 交替更新：先在线
+                    mu = getattr(self, 'fedprox_mu', 0.0)
+
+                    if mu > 0:
+                        global_snapshot = getattr(self, 'initial_params', None)
+                        offline_snapshot = getattr(self, 'initial_offline_params', None)
+
+                        if global_snapshot is not None:
+                            prox_term = self.apply_fedprox_proximal(self.model, global_snapshot, mu)
+                            dist_online_loss = dist_online_loss + prox_term
+
+                        if offline_snapshot is not None:
+                            prox_term_off = self.apply_fedprox_proximal(self.offline_model, offline_snapshot, mu)
+                            dist_offline_loss = dist_offline_loss + prox_term_off
                     self.optimizer.zero_grad()
                     dist_online_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
@@ -239,13 +252,24 @@ class clientMyMethod(clientAVG):
                     total_online_loss = local_train_online_loss
                     total_offline_loss = local_train_offline_loss
 
+                mu = getattr(self, 'fedprox_mu', 0.0)
+                if mu > 0:
+                    global_snapshot = getattr(self, 'initial_params', None)
+                    offline_snapshot = getattr(self, 'initial_offline_params', None)
+
+                    if global_snapshot is not None:
+                        prox_online = self.apply_fedprox_proximal(self.model, global_snapshot, mu)
+                        total_online_loss = total_online_loss + prox_online
+
+                    if offline_snapshot is not None:
+                        prox_offline = self.apply_fedprox_proximal(self.offline_model, offline_snapshot, mu)
+                        total_offline_loss = total_offline_loss + prox_offline
+
                 self.optimizer.zero_grad()
-                # total_online_loss = local_train_online_loss  #在线模型最终的损失函数(无分类器)
                 total_online_loss.backward()
                 self.optimizer.step()
 
                 self.offline_optimizer.zero_grad()
-                # total_offline_loss = local_train_offline_loss #离线模型最终的损失函数(无分类器)
                 total_offline_loss.backward()
                 self.offline_optimizer.step()
 
@@ -451,6 +475,9 @@ class clientMyMethod(clientAVG):
             for id, classifier in classifier_list.items():
                 # if id != self.id:
                 self.other_classifier[id] = copy.deepcopy(classifier)
+
+        self.initial_params = {name: param.data.clone().detach().to(self.device) for name, param in self.model.named_parameters()}
+        self.initial_offline_params = {name: param.data.clone().detach().to(self.device)for name, param in self.offline_model.named_parameters()}
                     # if classifier_list != {}:
                     #     self.other_classifier = {}
                     #
@@ -855,7 +882,8 @@ class clientMyMethod(clientAVG):
             if layer == 0:
                 self.train(round_idx, num_clients)
             else:
-                self.train_with_improved_layer_fusion(layer, round_idx, num_clients)
+                # self.train_with_improved_layer_fusion(layer, round_idx, num_clients)
+                self.train(round_idx,num_clients)
 
         except Exception as e:
             print(f"客户端 {self.id} 在第 {layer} 层训练时出错: {e}")
@@ -963,6 +991,8 @@ class clientMyMethod(clientAVG):
 
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
+
+
 
     def compute_output_statistics(self, output1, output2):
         """计算输出的统计特征"""
@@ -1594,3 +1624,17 @@ class clientMyMethod(clientAVG):
                     print(f"  Warning: Very low fusion impact - consider adjusting weights")
                 elif fusion_impact > 0.5:
                     print(f"  Warning: Very high fusion impact - may cause instability")
+
+    def apply_fedprox_proximal(self, model, global_params_dict, mu):
+        """
+        Compute proximal penalty: (mu/2) * sum ||param - global_param||^2
+        global_params_dict: mapping name -> tensor (server-sent snapshot)
+        """
+        if mu is None or mu <= 0:
+            return 0.0
+        prox = 0.0
+        for name, p in model.named_parameters():
+            if name in global_params_dict:
+                g = global_params_dict[name].to(p.device)
+                prox += ((p - g).norm(2) ** 2)
+        return 0.5 * mu * prox

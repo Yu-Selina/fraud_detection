@@ -1,4 +1,5 @@
 import copy
+import math
 import time
 import random
 import torch
@@ -301,12 +302,13 @@ class MyMethod(FedAvg):
 
         # 综合相似度
         return 0.4 * mag_sim + 0.4 * sparse_sim + 0.2 * loss_sim
-    def compute_fraud_rate_similarity(self, rate1, rate2):
-        """计算基于欺诈率的相似度"""
-        # 使用指数衰减函数计算相似度
-        diff = abs(rate1 - rate2)
-        similarity = np.exp(-diff * 10)  # 10是敏感度参数
-        return similarity
+
+    # def compute_fraud_rate_similarity(self, rate1, rate2):
+    #     """计算基于欺诈率的相似度"""
+    #     # 使用指数衰减函数计算相似度
+    #     diff = abs(rate1 - rate2)
+    #     similarity = np.exp(-diff * 10)  # 10是敏感度参数
+    #     return similarity
 
 
 
@@ -355,32 +357,34 @@ class MyMethod(FedAvg):
 
         return clusters
 #######################################################################################################################################
-    def compute_parameter_similarity(self, client_i_id, client_j_id):
-        """基于模型参数计算相似度"""
-        if (client_i_id >= len(self.client_parameters_history) or
-                client_j_id >= len(self.client_parameters_history) or
-                len(self.client_parameters_history[client_i_id]) == 0 or
-                len(self.client_parameters_history[client_j_id]) == 0):
-            return 0.5  # 默认中等相似度
 
-        params_i = self.client_parameters_history[client_i_id][-1]
-        params_j = self.client_parameters_history[client_j_id][-1]
 
-        similarity = 0.0
-        total_params = 0
-
-        for key in params_i.keys():
-            if key in params_j and 'bn' not in key:
-                param_i_flat = params_i[key].flatten()
-                param_j_flat = params_j[key].flatten()
-
-                if param_i_flat.shape == param_j_flat.shape:
-                    cos_sim = F.cosine_similarity(param_i_flat.unsqueeze(0),
-                                                  param_j_flat.unsqueeze(0))
-                    similarity += cos_sim.item() * param_i_flat.numel()
-                    total_params += param_i_flat.numel()
-
-        return similarity / total_params if total_params > 0 else 0.5
+    # def compute_parameter_similarity(self, client_i_id, client_j_id):
+    #     """基于模型参数计算相似度"""
+    #     if (client_i_id >= len(self.client_parameters_history) or
+    #             client_j_id >= len(self.client_parameters_history) or
+    #             len(self.client_parameters_history[client_i_id]) == 0 or
+    #             len(self.client_parameters_history[client_j_id]) == 0):
+    #         return 0.5  # 默认中等相似度
+    #
+    #     params_i = self.client_parameters_history[client_i_id][-1]
+    #     params_j = self.client_parameters_history[client_j_id][-1]
+    #
+    #     similarity = 0.0
+    #     total_params = 0
+    #
+    #     for key in params_i.keys():
+    #         if key in params_j and 'bn' not in key:
+    #             param_i_flat = params_i[key].flatten()
+    #             param_j_flat = params_j[key].flatten()
+    #
+    #             if param_i_flat.shape == param_j_flat.shape:
+    #                 cos_sim = F.cosine_similarity(param_i_flat.unsqueeze(0),
+    #                                               param_j_flat.unsqueeze(0))
+    #                 similarity += cos_sim.item() * param_i_flat.numel()
+    #                 total_params += param_i_flat.numel()
+    #
+    #     return similarity / total_params if total_params > 0 else 0.5
 
 
     def perform_hierarchical_clustering(self, similarity_matrix):
@@ -1002,8 +1006,8 @@ class MyMethod(FedAvg):
             self.early_stop = True
             print(f"Early stopping triggered after {self.num_bad_rounds} rounds without improvement")
 
-    def init_layer(self):
-        self.structure[0][0] = [np.arange(self.num_clients),]
+    # def init_layer(self):
+    #     self.structure[0][0] = [np.arange(self.num_clients),]
 
     def log_round_summary(self, round_num):
         """每轮结束的汇总信息"""
@@ -1086,60 +1090,143 @@ class MyMethod(FedAvg):
             print("Matplotlib or Seaborn not installed. Cannot generate plots.")
             print("Please install them with: pip install matplotlib seaborn")
 
-    def detect_fraud_gradient_conflicts(self, layer):
-        """检测欺诈检测中的梯度冲突（基于FedAWA理论）"""
+    def detect_fraud_gradient_conflicts(self, layer, use_last_layer_only=True, similarity_threshold=0.2,
+                                        negative_frac_threshold=0.2):
+        """
+        更稳健的欺诈梯度冲突检测。
+        - use_last_layer_only: 推荐对最后 classifier 层或最后若干层计算向量以降低噪声。
+        - similarity_threshold: 平均相似度低于该阈值视为冲突。
+        - negative_frac_threshold: 如果负相似度占比超过该阈值，也判冲突。
+        返回: bool conflict_detected
+        同时会把数值追加到 self.layer_metrics[layer]。
+        """
+
+        # 少于 2 个 client 无法判定冲突
         if len(self.selected_clients) < 2:
             return False
 
-        # 收集有欺诈样本的客户端
+        # 收集“含欺诈样本”的客户端（只考虑这些进行欺诈方向的冲突检测）
         fraud_clients = []
-        normal_only_clients = []
-
-        for client_id in [c.id for c in self.selected_clients]:
-            fraud_count = self.get_client_fraud_count(client_id)
-            if fraud_count > 0:
-                fraud_clients.append(client_id)
-            else:
-                normal_only_clients.append(client_id)
-
-        # 如果欺诈客户端太少，无法检测有意义的冲突
+        for c in self.selected_clients:
+            if self.get_client_fraud_count(c.id) > 0:
+                fraud_clients.append(c.id)
         if len(fraud_clients) < 2:
             return False
 
-        # 基于客户端更新向量计算冲突
-        client_vectors = {}
-        for client_id in fraud_clients:
-            if hasattr(self, 'client_parameters_history') and client_id < len(self.client_parameters_history):
-                if len(self.client_parameters_history[client_id]) > 0:
-                    client_vectors[client_id] = self.compute_fraud_aware_client_vector(client_id, layer)
+        # 收集向量（尝试使用 latest uploaded model diffs，如果没有则退回到 client_parameters_history）
+        client_vecs = {}
+        for cid in fraud_clients:
+            vec = self._compute_client_update_vector_for_conflict(cid, layer, use_last_layer_only=use_last_layer_only)
+            if vec is not None:
+                client_vecs[cid] = vec
 
-        if len(client_vectors) < 2:
+        if len(client_vecs) < 2:
+            # 无足够向量可比较
             return False
 
-        # 计算向量间相似度
-        similarities = []
-        client_ids = list(client_vectors.keys())
+        # 计算两两余弦相似度
+        ids = list(client_vecs.keys())
+        sims = []
+        neg_count = 0
+        total_pairs = 0
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                g1 = client_vecs[ids[i]]
+                g2 = client_vecs[ids[j]]
+                sim = self._cosine_similarity(g1, g2)
+                sims.append(sim)
+                total_pairs += 1
+                if sim < 0:
+                    neg_count += 1
 
-        for i in range(len(client_ids)):
-            for j in range(i + 1, len(client_ids)):
-                vec_i = client_vectors[client_ids[i]]
-                vec_j = client_vectors[client_ids[j]]
+        avg_sim = float(np.mean(sims)) if len(sims) > 0 else 1.0
+        neg_frac = float(neg_count) / total_pairs if total_pairs > 0 else 0.0
 
-                # 简化的相似度计算
-                if vec_i and vec_j:
-                    sim = self.compute_vector_similarity(vec_i, vec_j)
-                    similarities.append(sim)
+        # 冲突判据：平均相似度过低 或 负相似度占比过高
+        conflict_detected = (avg_sim < similarity_threshold) or (neg_frac > negative_frac_threshold)
 
-        if similarities:
-            avg_similarity = sum(similarities) / len(similarities)
-            conflict_detected = avg_similarity < 0.3  # 相似度阈值
+        # 记录指标
+        if layer not in self.layer_metrics:
+            self.layer_metrics[layer] = {'gradient_conflicts': [], 'fraud_gradient_norms': [], 'convergence_scores': []}
+        self.layer_metrics[layer]['gradient_conflicts'].append(conflict_detected)
+        self.layer_metrics[layer]['fraud_gradient_norms'].append(
+            np.mean([np.linalg.norm(v) for v in client_vecs.values()]))
 
-            # 记录到层级指标中
-            self.layer_metrics[layer]['gradient_conflicts'].append(conflict_detected)
+        # 可选：把冲突详情也记录以便离线分析
+        self.layer_metrics[layer].setdefault('conflict_details', []).append({
+            'avg_sim': avg_sim, 'neg_frac': neg_frac, 'num_clients_compared': len(client_vecs)
+        })
 
-            return conflict_detected
+        return bool(conflict_detected)
 
-        return False
+    # -----------------
+    # 辅助方法：放到同一个类里
+    # -----------------
+    def _compute_client_update_vector_for_conflict(self, client_id, layer, use_last_layer_only=True):
+        """
+        尝试从 self.uploaded_models 或 client_parameters_history 获取客户端的“更新向量”。
+        返回 np.array(flattened vector) 或 None。
+        优先使用最新上传的 model 差值（与上一轮 global model 的差）。
+        如果只需最后一层/分类器，提取对应参数以减少噪声。
+        """
+        # 优先使用 self.uploaded_models（如果存在）
+        # uploaded_models 是训练后客户端上传的 model 实例列表（server 在聚合前有这个）
+        if hasattr(self, 'uploaded_models') and len(self.uploaded_models) > 0:
+            # uploaded_ids 对应每个 model 的 client id 顺序
+            for model, cid in zip(self.uploaded_models, self.uploaded_ids):
+                if cid == client_id:
+                    try:
+                        # 计算 model.parameters() - self.global_model.parameters()
+                        global_state = self.global_model.state_dict()
+                        vecs = []
+                        for name, param in model.state_dict().items():
+                            # 可选：只考虑 classifier 层（名字中含 'classifier' 或最后一个 linear）
+                            if use_last_layer_only:
+                                if 'classifier' not in name and 'fc' not in name and 'head' not in name:
+                                    continue
+                            # skip bn tracking buffers
+                            if 'num_batches_tracked' in name:
+                                continue
+                            p = param.float().cpu().numpy()
+                            g = p - global_state[name].float().cpu().numpy()
+                            vecs.append(g.ravel())
+                        if not vecs:
+                            return None
+                        flat = np.concatenate(vecs)
+                        return flat
+                    except Exception as e:
+                        return None
+
+        # 否则尝试从 client_parameters_history 中构建（history 中应包含 state_dict 或差分）
+        if hasattr(self, 'client_parameters_history') and client_id < len(self.client_parameters_history):
+            history = self.client_parameters_history[client_id]
+            if len(history) >= 1:
+                # 取最近一次上传的 state_dict（假设 history 存的是 state_dict）
+                last = history[-1]
+                if isinstance(last, dict):
+                    vecs = []
+                    for name, v in last.items():
+                        if use_last_layer_only:
+                            if 'classifier' not in name and 'fc' not in name and 'head' not in name:
+                                continue
+                        try:
+                            arr = v.cpu().numpy()
+                            vecs.append(arr.ravel())
+                        except:
+                            continue
+                    if vecs:
+                        return np.concatenate(vecs)
+        return None
+
+    def _cosine_similarity(self, a, b, eps=1e-8):
+        """a, b are numpy arrays"""
+        a = a.astype(np.float64)
+        b = b.astype(np.float64)
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na < eps or nb < eps:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb + eps))
 
     def get_client_fraud_count(self, client_id):
         """获取客户端欺诈样本数量（基于你提供的分布）"""
@@ -1214,112 +1301,186 @@ class MyMethod(FedAvg):
 
         print(f"第 {layer} 层使用欺诈感知聚合，权重分布: {[f'{w:.3f}' for w in aggregation_weights[:5]]}")
 
-    def compute_fraud_aware_weights(self):
-        """计算基于欺诈样本的聚合权重"""
-        weights = []
+    def compute_fraud_aware_weights(self, alpha=0.5, max_client_share=0.5, clip_eps=1e-3, fools_gold_clip=0.1):
+        """
+        New fraud-aware weight:
+          w_i = alpha * sample_weight_i + (1-alpha) * fraud_weight_i
+          w_i := w_i * foolsgold_penalty_i
+          clip w_i to [clip_eps, max_client_share], then normalize to sum 1.
 
-        for i, client_id in enumerate(self.uploaded_ids):
-            fraud_count = self.get_client_fraud_count(client_id)
-            sample_count = self.get_client_sample_count(client_id)
+        - alpha: tradeoff sample vs fraud-proportion
+        - max_client_share: avoid single client dominating
+        - fools_gold_clip: min penalty (so we never zero-out)
+        """
+        # collect arrays
+        m = len(self.uploaded_models)
+        if m == 0:
+            return []
 
-            # 基础权重（样本数）
-            base_weight = self.uploaded_weights[i]  # 原始的样本比例权重
+        # uploaded_ids, uploaded_weights assumed to be present (existing code uses them)
+        ids = list(self.uploaded_ids)
+        base_weights = np.array(self.uploaded_weights, dtype=float)
+        # normalize base_weights defensively
+        if base_weights.sum() <= 0:
+            base_weights = np.ones_like(base_weights) / len(base_weights)
+        else:
+            base_weights = base_weights / (base_weights.sum() + 1e-12)
 
-            if fraud_count == 0:
-                # 无欺诈样本的客户端：大幅降低权重
-                final_weight = base_weight * 0.2
-            else:
-                # 有欺诈样本的客户端：根据比例增强权重
-                fraud_ratio = fraud_count / sample_count
+        sample_counts = np.array([self.get_client_sample_count(cid) for cid in ids], dtype=float)
+        fraud_counts = np.array([self.get_client_fraud_count(cid) for cid in ids], dtype=float)
 
-                # 欺诈率越高，权重增强越多（但有上限）
-                enhancement_factor = min(3.0, 1.0 + fraud_ratio * 5.0)
-                final_weight = base_weight * enhancement_factor
+        # sample-based weight (normalized)
+        sample_w = sample_counts / (sample_counts.sum() + 1e-12)
 
-            weights.append(final_weight)
+        # fraud-based weight: use fraud ratio (smoothed)
+        fraud_ratio = np.divide(fraud_counts, sample_counts + 1e-12)
+        # map to [0,1] sensibly, with sqrt damping to avoid extreme amplification
+        fraud_w_unnorm = np.sqrt(fraud_ratio)
+        if fraud_w_unnorm.sum() > 0:
+            fraud_w = fraud_w_unnorm / fraud_w_unnorm.sum()
+        else:
+            fraud_w = np.ones_like(fraud_w_unnorm) / len(fraud_w_unnorm)
 
-        # 归一化权重
-        total_weight = sum(weights)
-        if total_weight > 0:
-            weights = [w / total_weight for w in weights]
+        # basic combined weight
+        comb = alpha * sample_w + (1.0 - alpha) * fraud_w
 
-        return weights
+        # ---- FoolsGold-like penalty: penalize clients whose updates are *highly similar* to others ----
+        # compute per-client max cosine similarity to others using uploaded_models (or parameter-history if available)
+        try:
+            from torch.nn.utils import parameters_to_vector
+            vecs = []
+            for model in self.uploaded_models:
+                try:
+                    v = parameters_to_vector([p.data.clone().flatten() for p in model.parameters()])
+                except Exception:
+                    # fallback: flatten state_dict tensors
+                    sd = model.state_dict()
+                    vec = []
+                    for k in sd:
+                        t = sd[k].float().view(-1)
+                        vec.append(t)
+                    v = torch.cat(vec)
+                vecs.append(v.cpu().numpy())
+            # compute cosine similarities
+            sims = np.zeros((m, m), dtype=float)
+            for i in range(m):
+                for j in range(i + 1, m):
+                    a = vecs[i]
+                    b = vecs[j]
+                    denom = (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)
+                    sims[i, j] = sims[j, i] = float(np.dot(a, b) / denom)
+            max_sim = sims.max(axis=1)
+            # penalty in (fools_gold_clip, 1.0]; higher when max_sim small
+            penalties = 1.0 - max_sim  # if max_sim near 1 => penalty near 0
+            # scale into [fools_gold_clip, 1]
+            penalties = np.clip(penalties, fools_gold_clip, 1.0)
+        except Exception:
+            # if anything fails, keep neutral penalty
+            penalties = np.ones(m, dtype=float)
 
-    def weighted_parameter_aggregation(self, weights):
-        """执行加权参数聚合"""
+        # apply penalty
+        comb = comb * penalties
+
+        # apply base_weights as prior (so server-specified uploaded_weights still matter)
+        final = comb * base_weights
+
+        # clip and normalize (avoid single-client domination)
+        final = np.clip(final, clip_eps, max_client_share)
+        if final.sum() <= 0:
+            final = np.ones_like(final) / len(final)
+        else:
+            final = final / final.sum()
+        return final.tolist()
+
+    def weighted_parameter_aggregation(self, weights, trim_ratio=0.2):
+        """
+        Perform parameter aggregation with:
+          - weight clipping & normalization (caller should pass normalized weights),
+          - if evidence of suspicious clients (e.g., max(weight) too large OR detected conflict),
+            do coordinate-wise trimmed mean as robust fallback.
+        """
         if len(self.uploaded_models) == 0:
             return
+        # normalize defensively
+        w = np.array(weights, dtype=float)
+        if w.sum() <= 0:
+            w = np.ones_like(w) / len(w)
+        else:
+            w = w / w.sum()
 
-        # 获取全局模型的状态字典
+        # quick check: if a single client dominates or conflict mode flagged -> use trimmed mean
+        dominant = (w.max() > 0.45)  # threshold; tuneable
+        conflict_flag = getattr(self, 'conflict_mode_active', False)
+        use_trim = dominant or conflict_flag
+
         global_dict = self.global_model.state_dict()
-
-        # 对每个参数进行加权平均
+        # for each parameter tensor, create stacked tensor across clients
         for key in global_dict.keys():
             if 'num_batches_tracked' in key:
-                continue  # 跳过BatchNorm的跟踪参数
+                continue
+            # collect list of tensors for this key
+            parts = []
+            for model in self.uploaded_models:
+                sd = model.state_dict()
+                if key in sd:
+                    parts.append(sd[key].detach().cpu())
+            if len(parts) == 0:
+                continue
+            # stack
+            stacked = torch.stack(parts, dim=0)  # shape (m, *param_shape)
+            if use_trim and stacked.shape[0] >= 3:
+                m = stacked.shape[0]
+                k = int(max(1, math.floor(trim_ratio * m)))
+                # sort along client-dimension
+                sorted_vals, _ = torch.sort(stacked, dim=0)
+                trimmed = sorted_vals[k:m - k].mean(dim=0)
+                agg = trimmed.to(self.device)
+            else:
+                # weighted average
+                # ensure weight vector matches parts length (in case some missing)
+                ws = torch.tensor(w[: stacked.shape[0]], dtype=torch.float32).view(-1, *([1] * (stacked.dim() - 1)))
+                agg = (stacked * ws).sum(dim=0).to(self.device)
+            # copy back
+            try:
+                global_dict[key].data.copy_(agg)
+            except Exception:
+                # fallback: attempt elementwise assignment
+                global_dict[key] = agg
 
-            # 初始化为零张量
-            weighted_param = torch.zeros_like(global_dict[key])
-
-            # 加权求和
-            for model, weight in zip(self.uploaded_models, weights):
-                if key in model.state_dict():
-                    weighted_param += weight * model.state_dict()[key].to(self.device)
-
-            # 更新全局模型
-            global_dict[key].data.copy_(weighted_param)
-
-    def fraud_detection_convergence_monitor(self, layer, round_idx, metrics):
-        """基于欺诈检测理论的收敛监控"""
-        current_f1 = metrics.get('f1', 0.0)
-        current_auc = metrics.get('auc', 0.5)
-        current_recall = metrics.get('recall', 0.0)
-
-        # 初始化层级历史
+    def fraud_detection_convergence_monitor(self, layer, round_idx, metrics, patience=3, min_delta=1e-4):
+        # metrics: dict with 'f1','auc','recall'
         if not hasattr(self, 'layer_convergence_history'):
             self.layer_convergence_history = {}
         if layer not in self.layer_convergence_history:
-            self.layer_convergence_history[layer] = {'f1': [], 'auc': [], 'recall': []}
+            self.layer_convergence_history[layer] = {'f1': [], 'auc': [], 'recall': [], 'bad_rounds': 0,
+                                                     'best_f1': -1.0, 'best_auc': -1.0}
+        hist = self.layer_convergence_history[layer]
+        f1 = metrics.get('f1', 0.0)
+        auc = metrics.get('auc', 0.5)
+        recall = metrics.get('recall', 0.0)
+        hist['f1'].append(f1);
+        hist['auc'].append(auc);
+        hist['recall'].append(recall)
 
-        # 记录当前指标
-        self.layer_convergence_history[layer]['f1'].append(current_f1)
-        self.layer_convergence_history[layer]['auc'].append(current_auc)
-        self.layer_convergence_history[layer]['recall'].append(current_recall)
+        improved = False
+        # strict improvement on F1
+        if f1 > hist['best_f1'] + min_delta:
+            hist['best_f1'] = f1
+            improved = True
+        # if F1 not improved but AUC improved significantly, allow as improvement
+        elif auc > hist['best_auc'] + min_delta:
+            hist['best_auc'] = auc
+            improved = True
 
-        should_stop = False
-        stop_reasons = []
-
-        # 1. 性能连续下降检查
-        if len(self.layer_convergence_history[layer]['f1']) >= 3:
-            recent_f1 = self.layer_convergence_history[layer]['f1'][-3:]
-            if all(recent_f1[i] >= recent_f1[i + 1] for i in range(len(recent_f1) - 1)) and recent_f1[0] - recent_f1[
-                -1] > 0.01:
-                should_stop = True
-                stop_reasons.append("F1连续显著下降")
-
-        # 2. 性能过低检查（针对欺诈检测）
-        if round_idx >= 3 and current_f1 < 0.03 and current_auc < 0.55:
-            should_stop = True
-            stop_reasons.append("性能过低无改善")
-
-        # 3. 梯度冲突过多
-        if (hasattr(self, 'layer_metrics') and layer in self.layer_metrics and
-                len(self.layer_metrics[layer]['gradient_conflicts']) > 0):
-            recent_conflicts = self.layer_metrics[layer]['gradient_conflicts'][-3:]
-            if len(recent_conflicts) >= 3 and sum(recent_conflicts) >= 2:
-                should_stop = True
-                stop_reasons.append("梯度冲突频繁")
-
-        # 4. 欺诈检测特定：召回率过低
-        if round_idx >= 5 and current_recall < 0.05:
-            should_stop = True
-            stop_reasons.append("召回率过低")
-
-        if should_stop:
-            print(f"第 {layer} 层轮次 {round_idx} 触发早停: {', '.join(stop_reasons)}")
-            print(f"最终指标: F1={current_f1:.4f}, AUC={current_auc:.4f}, Recall={current_recall:.4f}")
-
-        return should_stop
+        if improved:
+            hist['bad_rounds'] = 0
+            return False
+        else:
+            hist['bad_rounds'] += 1
+            # but if recall improves, be lenient (don't increment bad_rounds or decrement threshold)
+            if recall > (max(hist['recall']) if hist['recall'][:-1] else 0.0):
+                hist['bad_rounds'] = max(0, hist['bad_rounds'] - 1)
+            return hist['bad_rounds'] >= patience
 
     def adjust_aggregation_strategy(self, layer, mode):
         """根据检测到的问题调整聚合策略"""
