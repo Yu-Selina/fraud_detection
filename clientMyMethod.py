@@ -106,6 +106,8 @@ class clientMyMethod(clientAVG):
 
 
 
+
+
     def train(self,global_rounds,num_clients):
 
         sum_local_online_loss = 0.0
@@ -1638,3 +1640,49 @@ class clientMyMethod(clientAVG):
                 g = global_params_dict[name].to(p.device)
                 prox += ((p - g).norm(2) ** 2)
         return 0.5 * mu * prox
+
+    def get_client_fraud_level(self):
+        """
+        在客户端本地计算欺诈比例并映射为离散等级（整数）。
+        服务器只接收等级（0,1,2），而不会看到具体数量或比例。
+
+        等级示例（可按需要调整阈值）：
+        level 0: 低欺诈 (ratio <= 0.5%)
+        level 1: 中等欺诈 (0.5% < ratio <= 1.5%)
+        level 2: 高欺诈 (ratio > 1.5%)
+        """
+        try:
+            # 尽量从已有的本地标签数据获取，兼容不同数据结构
+            if hasattr(self, 'y_train'):
+                y = self.y_train
+            else:
+                # 退而求其次，从样本集中载入一遍（代价低，且本地）
+                loader = self.load_train_data()
+                all_labels = []
+                for _, batch_y in loader:
+                    # 支持 list 或 tensor
+                    if type(batch_y) == type([]):
+                        batch_y = batch_y[0]
+                    all_labels.append(batch_y.cpu().numpy())
+                if len(all_labels) == 0:
+                    return 0
+                y = np.concatenate(all_labels)
+            # 计算比例
+            if isinstance(y, torch.Tensor):
+                num_fraud = int((y == 1).sum().item())
+                num_total = int(len(y))
+            else:
+                num_fraud = int(np.sum(np.array(y) == 1))
+                num_total = int(len(y))
+            ratio = (num_fraud / num_total) if num_total > 0 else 0.0
+        except Exception:
+            # 出于鲁棒性考虑，若任何异常则返回中间等级
+            return 1
+
+        # 阈值按你的数据集特征调整
+        if ratio <= 0.005:
+            return 0
+        elif ratio <= 0.015:
+            return 1
+        else:
+            return 2

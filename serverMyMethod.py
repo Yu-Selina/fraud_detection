@@ -11,7 +11,7 @@ from system.flcore.servers.serveravg import FedAvg
 from system.flcore.clients.clientMyMethod import clientMyMethod
 from sklearn.metrics import accuracy_score, recall_score, f1_score, precision_recall_curve, auc,  roc_auc_score
 import torch.nn.functional as F
-
+from config_privacy import *
 
 
 class MyMethod(FedAvg):
@@ -1090,74 +1090,49 @@ class MyMethod(FedAvg):
             print("Matplotlib or Seaborn not installed. Cannot generate plots.")
             print("Please install them with: pip install matplotlib seaborn")
 
-    def detect_fraud_gradient_conflicts(self, layer, use_last_layer_only=True, similarity_threshold=0.2,
-                                        negative_frac_threshold=0.2):
+    def detect_fraud_gradient_conflicts(self, layer):
         """
-        更稳健的欺诈梯度冲突检测。
-        - use_last_layer_only: 推荐对最后 classifier 层或最后若干层计算向量以降低噪声。
-        - similarity_threshold: 平均相似度低于该阈值视为冲突。
-        - negative_frac_threshold: 如果负相似度占比超过该阈值，也判冲突。
-        返回: bool conflict_detected
-        同时会把数值追加到 self.layer_metrics[layer]。
+        原先可能基于客户端的精确欺诈比例来检测梯度冲突。
+        现在我们只使用离散等级信息，并结合梯度/更新签名来做判定。
+
+        如果等级差 >= 2（即 0 vs 2），则直接标为高冲突概率；
+        如果等级差 = 1，则进一步检查更新签名/梯度范数差异以决定。
         """
-
-        # 少于 2 个 client 无法判定冲突
-        if len(self.selected_clients) < 2:
+        active_list = sorted(list(self.active_clients_set))
+        # 若客户端过少，返回 False
+        if len(active_list) < 2:
             return False
 
-        # 收集“含欺诈样本”的客户端（只考虑这些进行欺诈方向的冲突检测）
-        fraud_clients = []
-        for c in self.selected_clients:
-            if self.get_client_fraud_count(c.id) > 0:
-                fraud_clients.append(c.id)
-        if len(fraud_clients) < 2:
-            return False
+        # 读取 fraud level（整数）
+        levels = {}
+        for client in [self.clients[i] for i in active_list]:
+            cid = client.id
+            levels[cid] = self.get_client_fraud_level(client)
 
-        # 收集向量（尝试使用 latest uploaded model diffs，如果没有则退回到 client_parameters_history）
-        client_vecs = {}
-        for cid in fraud_clients:
-            vec = self._compute_client_update_vector_for_conflict(cid, layer, use_last_layer_only=use_last_layer_only)
-            if vec is not None:
-                client_vecs[cid] = vec
-
-        if len(client_vecs) < 2:
-            # 无足够向量可比较
-            return False
-
-        # 计算两两余弦相似度
-        ids = list(client_vecs.keys())
-        sims = []
-        neg_count = 0
-        total_pairs = 0
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                g1 = client_vecs[ids[i]]
-                g2 = client_vecs[ids[j]]
-                sim = self._cosine_similarity(g1, g2)
-                sims.append(sim)
-                total_pairs += 1
-                if sim < 0:
-                    neg_count += 1
-
-        avg_sim = float(np.mean(sims)) if len(sims) > 0 else 1.0
-        neg_frac = float(neg_count) / total_pairs if total_pairs > 0 else 0.0
-
-        # 冲突判据：平均相似度过低 或 负相似度占比过高
-        conflict_detected = (avg_sim < similarity_threshold) or (neg_frac > negative_frac_threshold)
-
-        # 记录指标
-        if layer not in self.layer_metrics:
-            self.layer_metrics[layer] = {'gradient_conflicts': [], 'fraud_gradient_norms': [], 'convergence_scores': []}
-        self.layer_metrics[layer]['gradient_conflicts'].append(conflict_detected)
-        self.layer_metrics[layer]['fraud_gradient_norms'].append(
-            np.mean([np.linalg.norm(v) for v in client_vecs.values()]))
-
-        # 可选：把冲突详情也记录以便离线分析
-        self.layer_metrics[layer].setdefault('conflict_details', []).append({
-            'avg_sim': avg_sim, 'neg_frac': neg_frac, 'num_clients_compared': len(client_vecs)
-        })
-
-        return bool(conflict_detected)
+        # 快速判定：若存在明显等级差异的客户端对，则认为冲突
+        for i in range(len(active_list)):
+            for j in range(i + 1, len(active_list)):
+                a = active_list[i]
+                b = active_list[j]
+                la = levels.get(a, 1)
+                lb = levels.get(b, 1)
+                if abs(la - lb) >= 2:
+                    # 0 vs 2：强不一致信号
+                    return True
+                elif abs(la - lb) == 1:
+                    # 1级差需要进一步检查参数更新签名或梯度范数
+                    sig_a = self.extract_update_signature(a)
+                    sig_b = self.extract_update_signature(b)
+                    # 如果签名不可用，则保守地认为冲突
+                    if sig_a is None or sig_b is None:
+                        return True
+                    # 计算 magnitude pattern 差距
+                    mag_diff = np.linalg.norm(
+                        sig_a.get('magnitude_pattern', np.zeros(1)) - sig_b.get('magnitude_pattern', np.zeros(1)))
+                    # 若差距较大则认为冲突（阈值可调）
+                    if mag_diff > 1.0:
+                        return True
+        return False
 
     # -----------------
     # 辅助方法：放到同一个类里
@@ -1228,45 +1203,31 @@ class MyMethod(FedAvg):
             return 0.0
         return float(np.dot(a, b) / (na * nb + eps))
 
-    def get_client_fraud_count(self, client_id):
-        """获取客户端欺诈样本数量（基于你提供的分布）"""
-        fraud_counts = {
-            0: 0, 1: 2000, 2: 718, 3: 0, 4: 1124, 5: 2452, 6: 2080, 7: 89,
-            8: 0, 9: 0, 10: 297, 11: 0, 12: 0, 13: 114, 14: 497, 15: 0,
-            16: 0, 17: 5186, 18: 946, 19: 5160
-        }
-        return fraud_counts.get(client_id, 0)
+    def compute_fraud_aware_client_vector(self, client):
+        """
+        生成一个“欺诈感知向量”，用于后续聚合/加权/聚类。
+        原来可能使用精确比例构建，现在使用 one-hot 的等级向量 + 可选的本地训练损失均值
+        以丰富特征，但**绝不包含精确欺诈数量**。
+        返回 numpy 向量（例如长度 4: [one-hot(3), avg_loss]）
+        """
+        level = self.get_client_fraud_level(client)
+        one_hot = np.zeros(3, dtype=float)
+        if level in (0, 1, 2):
+            one_hot[level] = 1.0
+        else:
+            one_hot[1] = 1.0
 
-    def compute_fraud_aware_client_vector(self, client_id, layer):
-        """计算欺诈感知的客户端向量"""
-        fraud_count = self.get_client_fraud_count(client_id)
+        # 从训练历史中取平均训练损失作为额外特征（不含标签信息）
+        cid = client.id
+        loss_feat = 0.0
+        if cid < len(self.client_training_history) and len(self.client_training_history[cid]) > 0:
+            recent = [r.get('loss', 0.0) for r in self.client_training_history[cid][-5:]]
+            loss_feat = float(np.mean(recent))
+        else:
+            loss_feat = 0.5
 
-        if fraud_count == 0:
-            return {'type': 'normal_only', 'weight_factor': 0.1, 'fraud_ratio': 0.0}
-
-        # 基于最近的训练历史
-        if hasattr(self, 'client_training_history') and client_id < len(self.client_training_history):
-            recent_history = self.client_training_history[client_id][-3:] if self.client_training_history[
-                client_id] else []
-
-            if recent_history:
-                avg_loss = sum(record.get('loss', 0.5) for record in recent_history) / len(recent_history)
-                loss_variance = sum((record.get('loss', 0.5) - avg_loss) ** 2 for record in recent_history) / len(
-                    recent_history)
-
-                total_samples = self.get_client_sample_count(client_id)
-                fraud_ratio = fraud_count / total_samples if total_samples > 0 else 0.0
-
-                return {
-                    'type': 'fraud_aware',
-                    'fraud_ratio': fraud_ratio,
-                    'avg_loss': avg_loss,
-                    'loss_variance': loss_variance,
-                    'weight_factor': 1.0 + fraud_ratio  # 欺诈样本多的客户端权重更高
-                }
-
-        # 默认返回
-        return {'type': 'default', 'fraud_ratio': 0.05, 'weight_factor': 1.0}
+        vec = np.concatenate([one_hot, np.array([loss_feat])])
+        return vec
 
     def get_client_sample_count(self, client_id):
         """获取客户端总样本数量"""
@@ -1301,96 +1262,27 @@ class MyMethod(FedAvg):
 
         print(f"第 {layer} 层使用欺诈感知聚合，权重分布: {[f'{w:.3f}' for w in aggregation_weights[:5]]}")
 
-    def compute_fraud_aware_weights(self, alpha=0.5, max_client_share=0.5, clip_eps=1e-3, fools_gold_clip=0.1):
+
+    def compute_fraud_aware_weights(self, client):
         """
-        New fraud-aware weight:
-          w_i = alpha * sample_weight_i + (1-alpha) * fraud_weight_i
-          w_i := w_i * foolsgold_penalty_i
-          clip w_i to [clip_eps, max_client_share], then normalize to sum 1.
-
-        - alpha: tradeoff sample vs fraud-proportion
-        - max_client_share: avoid single client dominating
-        - fools_gold_clip: min penalty (so we never zero-out)
+        为聚合或为某些策略分配权重。不得使用精确样本数。
+        使用等级映射到权重的策略（可自定义映射或学习得到）。
+        返回单个浮点数权重。
         """
-        # collect arrays
-        m = len(self.uploaded_models)
-        if m == 0:
-            return []
-
-        # uploaded_ids, uploaded_weights assumed to be present (existing code uses them)
-        ids = list(self.uploaded_ids)
-        base_weights = np.array(self.uploaded_weights, dtype=float)
-        # normalize base_weights defensively
-        if base_weights.sum() <= 0:
-            base_weights = np.ones_like(base_weights) / len(base_weights)
+        level = self.get_client_fraud_level(client)
+        # 简单策略（可调整或用函数映射）
+        # 低欺诈 -> 普通权重
+        # 中等 -> 轻微增加（因为中等样本可能更具信息性）
+        # 高 -> 适当增加（因为高欺诈样本对模型影响力重要）
+        if level == 0:
+            return 1.0
+        elif level == 1:
+            return 1.2
+        elif level == 2:
+            return 1.5
         else:
-            base_weights = base_weights / (base_weights.sum() + 1e-12)
+            return 1.0
 
-        sample_counts = np.array([self.get_client_sample_count(cid) for cid in ids], dtype=float)
-        fraud_counts = np.array([self.get_client_fraud_count(cid) for cid in ids], dtype=float)
-
-        # sample-based weight (normalized)
-        sample_w = sample_counts / (sample_counts.sum() + 1e-12)
-
-        # fraud-based weight: use fraud ratio (smoothed)
-        fraud_ratio = np.divide(fraud_counts, sample_counts + 1e-12)
-        # map to [0,1] sensibly, with sqrt damping to avoid extreme amplification
-        fraud_w_unnorm = np.sqrt(fraud_ratio)
-        if fraud_w_unnorm.sum() > 0:
-            fraud_w = fraud_w_unnorm / fraud_w_unnorm.sum()
-        else:
-            fraud_w = np.ones_like(fraud_w_unnorm) / len(fraud_w_unnorm)
-
-        # basic combined weight
-        comb = alpha * sample_w + (1.0 - alpha) * fraud_w
-
-        # ---- FoolsGold-like penalty: penalize clients whose updates are *highly similar* to others ----
-        # compute per-client max cosine similarity to others using uploaded_models (or parameter-history if available)
-        try:
-            from torch.nn.utils import parameters_to_vector
-            vecs = []
-            for model in self.uploaded_models:
-                try:
-                    v = parameters_to_vector([p.data.clone().flatten() for p in model.parameters()])
-                except Exception:
-                    # fallback: flatten state_dict tensors
-                    sd = model.state_dict()
-                    vec = []
-                    for k in sd:
-                        t = sd[k].float().view(-1)
-                        vec.append(t)
-                    v = torch.cat(vec)
-                vecs.append(v.cpu().numpy())
-            # compute cosine similarities
-            sims = np.zeros((m, m), dtype=float)
-            for i in range(m):
-                for j in range(i + 1, m):
-                    a = vecs[i]
-                    b = vecs[j]
-                    denom = (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)
-                    sims[i, j] = sims[j, i] = float(np.dot(a, b) / denom)
-            max_sim = sims.max(axis=1)
-            # penalty in (fools_gold_clip, 1.0]; higher when max_sim small
-            penalties = 1.0 - max_sim  # if max_sim near 1 => penalty near 0
-            # scale into [fools_gold_clip, 1]
-            penalties = np.clip(penalties, fools_gold_clip, 1.0)
-        except Exception:
-            # if anything fails, keep neutral penalty
-            penalties = np.ones(m, dtype=float)
-
-        # apply penalty
-        comb = comb * penalties
-
-        # apply base_weights as prior (so server-specified uploaded_weights still matter)
-        final = comb * base_weights
-
-        # clip and normalize (avoid single-client domination)
-        final = np.clip(final, clip_eps, max_client_share)
-        if final.sum() <= 0:
-            final = np.ones_like(final) / len(final)
-        else:
-            final = final / final.sum()
-        return final.tolist()
 
     def weighted_parameter_aggregation(self, weights, trim_ratio=0.2):
         """
@@ -1490,3 +1382,28 @@ class MyMethod(FedAvg):
             # 可以进一步调整其他参数
         else:
             self.fraud_aware_aggregation_enabled = False
+
+    def get_client_fraud_level(self, client):
+        """
+        服务器端调用此接口以获取客户端的欺诈等级（整数），
+        而不是精确的欺诈计数或比例。
+
+        client: 客户端对象（clientMyMethod 实例）
+        返回值: integer in {0,1,2}（如果失败则返回 1 作为中性值）
+        """
+        try:
+            if hasattr(client, 'get_client_fraud_level'):
+                level = client.get_client_fraud_level()
+                # 防御：确保返回值受控
+                if level is None:
+                    return 1
+                if isinstance(level, int) and level in (0, 1, 2):
+                    return int(level)
+                else:
+                    # 如果客户端返回非预期值，退化为中间等级
+                    return 1
+            else:
+                return 1
+        except Exception:
+            # 保守策略：异常时返回中等风险等级
+            return 1
