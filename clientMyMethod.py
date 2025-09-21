@@ -17,8 +17,7 @@ class clientMyMethod(clientAVG):
     def __init__(self, args, id, train_samples, test_samples, **kwargs):
         super().__init__(args, id, train_samples, test_samples, **kwargs)
 
-        # 在线模型：标准BCE
-        self.loss = nn.BCEWithLogitsLoss()
+
 
         # 离线模型：加权BCE，给正样本更高权重
         def get_weighted_bce():
@@ -28,7 +27,8 @@ class clientMyMethod(clientAVG):
 
                 if pos_count > 0:
                     pos_weight = neg_count.float() / pos_count.float()
-                    pos_weight = torch.clamp(pos_weight, min=1.0, max=10.0)  # 限制权重范围
+                    # pos_weight = torch.clamp(pos_weight, min=1.0, max=10.0)  # 限制权重范围
+                    pos_weight = torch.clamp(pos_weight, min=1.0,max=50.0)  # 不限制权重范围
                 else:
                     pos_weight = torch.tensor(1.0)
 
@@ -40,6 +40,7 @@ class clientMyMethod(clientAVG):
 
             return weighted_bce_loss
 
+        self.loss = get_weighted_bce()
         self.offline_loss = get_weighted_bce()
 
         # 单向Teacher-Student参数
@@ -93,11 +94,6 @@ class clientMyMethod(clientAVG):
         self.detailed_logging = False
         self.local_analysis_done = False   #训练开始前调用本地数据分析
 
-        # 单向Teacher-Student参数
-        self.momentum_tau = getattr(args, 'momentum_tau', 0.99)
-        self.temperature = getattr(args, 'temperature', 4.0)
-        self.alpha = getattr(args, 'distill_alpha', 0.7)
-
         # 自适应学习率相关参数（替代AdaptiveLRScheduler类）
         self.base_lr = args.local_learning_rate
         self.warmup_rounds = getattr(args, 'warmup_rounds', 5)
@@ -108,10 +104,6 @@ class clientMyMethod(clientAVG):
         self.last_loss = 1.0
         self.global_loss = 1.0
 
-        # 初始化Teacher模型
-        self.teacher_model = copy.deepcopy(self.model)
-        for param in self.teacher_model.parameters():
-            param.requires_grad = False
 
 
 
@@ -869,7 +861,7 @@ class clientMyMethod(clientAVG):
                         (1 - self.momentum_tau) * student_param.data
                 )
 
-    def compute_kd_loss(self, student_logits, teacher_logits, labels):
+    def compute_kd_loss(self, student_logits, teacher_logits, labels, alpha):
         """计算单向知识蒸馏损失"""
         # 硬标签损失
         hard_loss = F.binary_cross_entropy_with_logits(student_logits, labels)
@@ -885,10 +877,10 @@ class clientMyMethod(clientAVG):
         ) * (self.temperature ** 2)
 
         # 组合损失
-        total_loss = self.alpha * hard_loss + (1 - self.alpha) * soft_loss
+        total_loss = alpha * hard_loss + (1 - alpha) * soft_loss
         return total_loss
 
-    def train_layer_specific(self, layer_idx, round_idx, num_clients):
+    def train_layer_specific(self, layer_idx, round_idx, num_clients, alpha):
         """单向teacher-student架构的层级训练"""
         trainloader = self.load_train_data()
         self.model.train()
@@ -929,7 +921,7 @@ class clientMyMethod(clientAVG):
                     teacher_output = teacher_output.squeeze()
 
                 # 计算知识蒸馏损失
-                loss = self.compute_kd_loss(student_output, teacher_output, y)
+                loss = self.compute_kd_loss(student_output, teacher_output, y, alpha)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -992,5 +984,33 @@ class clientMyMethod(clientAVG):
         # 只保留最近10次历史
         if len(self.loss_history) > 10:
             self.loss_history = self.loss_history[-10:]
+
+    def get_noisy_pos_ratio(self):
+        """
+        计算并返回带有差分隐私噪声的正样本比例。
+        """
+        pos_count = 0
+        total_count = 0
+        trainloader = self.load_train_data()
+        # 遍历整个数据集来计算正负样本数
+        for _, labels in trainloader:
+            pos_count += (labels == 1).sum().item()
+            total_count += len(labels)
+
+        true_pos_ratio = pos_count / total_count if total_count > 0 else 0.0
+
+        # 定义差分隐私参数 epsilon
+        privacy_epsilon = 0.5
+
+        # 计算拉普拉斯噪声的尺度参数 b
+        laplace_b = 1.0 / privacy_epsilon
+
+        # 生成拉普拉斯噪声并添加到真实比例中
+        noise = np.random.laplace(loc=0.0, scale=laplace_b)
+        noisy_pos_ratio = true_pos_ratio + noise
+
+        # 将近似值限制在 [0, 1] 范围内
+        return max(0.0, min(1.0, noisy_pos_ratio))
+
 
 # ----------------------------------------------------------------------------------------------------------------

@@ -104,10 +104,10 @@ class MyMethod(FedAvg):
         print(f"\n开始第 {layer} 层训练")
         print(f"活跃客户端: {[client.id for client in self.selected_clients]}")
 
-        # === 新增：渐进式层级训练设置 ===
+        # 渐进式层级训练设置
         self.progressive_layer_training(layer)
 
-        # === 新增：根据层级决定聚类策略 ===
+        # 根据层级决定聚类策略
         if layer == 0:
             # 第0层使用全局聚合
             clusters = [[client.id for client in self.selected_clients]]
@@ -132,7 +132,6 @@ class MyMethod(FedAvg):
             'convergence_scores': []
         }
 
-
         for round_idx in range(layer_rounds):
             s_t = time.time()
 
@@ -140,11 +139,14 @@ class MyMethod(FedAvg):
             self.selected_clients = self.select_active_clients()
             self.send_models_with_classifier()
 
+            noisy_client_ratios = self.get_noisy_pos_ratios(self.selected_clients)# 在每轮循环内部，为本轮被选中的客户端计算自适应 alpha
+            adaptive_alphas = self.compute_adaptive_alpha(noisy_client_ratios)
+
             if round_idx % self.eval_gap == 0:
                 print(f"\n--------- 第 {layer} 层，轮次 {round_idx} ---------")
                 for cluster_idx, cluster_client_ids in enumerate(clusters):
                     cluster_clients = [client for client in self.selected_clients if client.id in cluster_client_ids]
-                    self.train_cluster_clients(cluster_clients, layer, round_idx)
+                    self.train_cluster_clients(cluster_clients, layer, round_idx, adaptive_alphas)
                 self.current_round = round_idx # 为了区分不同层的轮次
                 self.evaluate()
             #梯度冲突检测
@@ -156,7 +158,7 @@ class MyMethod(FedAvg):
 
             # 客户端训练
             for client in self.selected_clients:
-                client.train_layer_specific(layer, round_idx, self.num_clients)
+                client.train_layer_specific(layer, round_idx, self.num_clients, adaptive_alphas[client.id])
             print(f"第 {layer} 层轮次 {round_idx} 完成客户端训练")
             # 检查上传的模型是否有异常
             if hasattr(self, 'fraud_aware_aggregation_enabled') and self.fraud_aware_aggregation_enabled:
@@ -164,7 +166,7 @@ class MyMethod(FedAvg):
             else:
                 self.aggregate_parameters_by_layer(layer)
 
-            # 【新增】理论驱动的收敛监控
+            #理论驱动的收敛监控
             metrics = {
                 'f1': self.rs_test_f1[-1] if self.rs_test_f1 else 0.0,
                 'auc': self.rs_test_auc[-1] if self.rs_test_auc else 0.5,
@@ -1372,7 +1374,7 @@ class MyMethod(FedAvg):
                     updates[client.id][name] = param.data.clone()
         return updates
 
-    def train_cluster_clients(self, cluster_clients, layer_idx, round_idx):
+    def train_cluster_clients(self, cluster_clients, layer_idx, round_idx,alpha):
         """训练聚类内的客户端"""
         for client in cluster_clients:
             # 设置自适应学习率
@@ -1381,8 +1383,9 @@ class MyMethod(FedAvg):
                 param_group['lr'] = adaptive_lr
             print(f"客户端 {client.id}: 自适应学习率 {adaptive_lr:.6f}")
 
+            client_alpha = alpha[client.id]
             # 训练客户端
-            client.train_layer_specific(layer_idx, round_idx, len(cluster_clients))
+            client.train_layer_specific(layer_idx, round_idx, len(cluster_clients), client_alpha)
 
             # 更新学习率历史信息
             training_loss = getattr(client, 'training_loss', 1.0)
@@ -1405,8 +1408,35 @@ class MyMethod(FedAvg):
 
         self.global_model.load_state_dict(global_dict)
 
+    def compute_adaptive_alpha(self, noisy_client_ratios):
+        """
+        根据客户端报告的带噪比例，计算每个客户端的自适应alpha值。
+        """
+        alphas = {}
+        min_alpha = 0.2  # 设置蒸馏权重的下限
+        max_alpha = 0.8  # 设置蒸馏权重的上限
+
+        for client_id, noisy_ratio in noisy_client_ratios.items():
+            # 欺诈样本比例越高，本地数据越重要，蒸馏权重 alpha 越低
+            # 使用一个简单的反向线性关系
+            alpha = 1 - noisy_ratio
+
+            # 将 alpha 限制在预设范围内，以保证训练稳定性
+            alphas[client_id] = max(min_alpha, min(max_alpha, alpha))
+
+        return alphas
+
+    def get_noisy_pos_ratios(self, clients): # 接收客户端对象列表
+        """
+        向指定的客户端请求其带噪的正样本比例。
+        """
+        noisy_ratios = {}
+        # clients 是一个包含客户端对象的列表，而不是 client_id 列表
+        for client in clients:
+            # 直接调用客户端对象的 get_noisy_pos_ratio 方法
+            noisy_ratios[client.id] = client.get_noisy_pos_ratio()
+        return noisy_ratios
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------
-
 
 
