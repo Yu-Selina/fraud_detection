@@ -68,7 +68,9 @@ class MyMethod(FedAvg):
 
         # 为极端non-IID调整的参数
         self.min_delta = 0.001  # 更小的改善阈值
-        self.patience = 3  # 更短的耐心，因为欺诈检测收敛慢
+        self.patience = 10  # 更短的耐心，因为欺诈检测收敛慢
+
+        self.global_loss = 1.0  # 用于跟踪全局损失
 
     # 修改主训练函数
     def train(self):
@@ -98,7 +100,27 @@ class MyMethod(FedAvg):
         self.plot_metrics()
 
     def train_current_layer(self, layer):
-        """训练当前层级"""
+        """训练指定层级的联邦学习"""
+        print(f"\n开始第 {layer} 层训练")
+        print(f"活跃客户端: {[client.id for client in self.selected_clients]}")
+
+        # === 新增：渐进式层级训练设置 ===
+        self.progressive_layer_training(layer)
+
+        # === 新增：根据层级决定聚类策略 ===
+        if layer == 0:
+            # 第0层使用全局聚合
+            clusters = [[client.id for client in self.selected_clients]]
+            print(f"第 {layer} 层采用全局聚合")
+        else:
+            # 高层级使用梯度相似度聚类
+            client_updates = self.collect_client_updates()
+            clusters = self.adaptive_layer_clustering(client_updates, layer)
+            print(f"第 {layer} 层生成了 {len(clusters)} 个聚类")
+            for i, cluster in enumerate(clusters):
+                print(f"聚类 {i}: 客户端 {cluster}")
+
+
         layer_rounds = self.layer_rounds[layer] if layer < len(self.layer_rounds) else 15
 
         #初始化层级监控
@@ -120,6 +142,9 @@ class MyMethod(FedAvg):
 
             if round_idx % self.eval_gap == 0:
                 print(f"\n--------- 第 {layer} 层，轮次 {round_idx} ---------")
+                for cluster_idx, cluster_client_ids in enumerate(clusters):
+                    cluster_clients = [client for client in self.selected_clients if client.id in cluster_client_ids]
+                    self.train_cluster_clients(cluster_clients, layer, round_idx)
                 self.current_round = round_idx # 为了区分不同层的轮次
                 self.evaluate()
             #梯度冲突检测
@@ -171,32 +196,54 @@ class MyMethod(FedAvg):
         selected_indices = random.sample(active_list, selected_num)
         return [self.clients[i] for i in selected_indices]
 
-    def generate_next_layer_clusters(self, current_layer):
-        """生成下一层的聚类"""
-        next_layer = current_layer + 1
-        self.structure[next_layer] = {}
+    def generate_next_layer_clusters(self, layer_idx):
+        """为下一层生成聚类"""
+        print(f"开始为第 {layer_idx} 层生成聚类...")
 
-        print(f"\n开始为第 {next_layer} 层生成聚类...")
+        if layer_idx == 0:
+            # 第0层使用全局聚合
+            clusters = [[client.id for client in self.selected_clients]]
+            print("第 0 层采用全局聚合")
+        else:
+            # 收集客户端更新
+            client_updates = self.collect_client_updates()
+            # 使用新的自适应聚类方法
+            cluster_ids = self.adaptive_layer_clustering(client_updates, layer_idx)
+            clusters = cluster_ids
 
-        # 计算客户端相似度矩阵
-        similarity_matrix = self.compute_client_similarity_matrix()
+            print(f"第 {layer_idx} 层生成了 {len(clusters)} 个聚类")
+            for i, cluster in enumerate(clusters):
+                print(f"聚类 {i}: 客户端 {cluster}")
 
-        # 执行层次聚类
-        clusters = self.perform_hierarchical_clustering(similarity_matrix)
+        return clusters
 
-        # 为每个聚类创建模型
-        cluster_id = 0
-        for cluster_clients in clusters:
-            if len(cluster_clients) >= self.min_clients_per_cluster:
-                cluster_model = self.create_cluster_model(cluster_clients, current_layer)
-                self.structure[next_layer][cluster_id] = [np.array(cluster_clients), cluster_model]
-                print(f"聚类 {cluster_id}: 客户端 {cluster_clients}")
-                cluster_id += 1
+    def perform_hierarchical_clustering(self, similarity_matrix):
+        """基于相似度矩阵进行层次聚类"""
+        client_ids = list(similarity_matrix.keys())
+        similarity_threshold = 0.7  # 可以根据需要调整
 
-        print(f"第 {next_layer} 层生成了 {len(self.structure[next_layer])} 个聚类")
+        clusters = []
+        assigned = set()
 
-        # 更新活跃客户端（移除表现差的客户端）
-        self.update_active_clients_based_on_performance()
+        for client_a in client_ids:
+            if client_a in assigned:
+                continue
+
+            cluster = [client_a]
+            assigned.add(client_a)
+
+            # 找到与当前客户端相似的其他客户端
+            for client_b in client_ids:
+                if (client_b not in assigned and
+                        client_b in similarity_matrix[client_a] and
+                        similarity_matrix[client_a][client_b] > similarity_threshold):
+                    cluster.append(client_b)
+                    assigned.add(client_b)
+
+            clusters.append(cluster)
+
+        return clusters
+
 #######################################################################################################################################
     def compute_client_similarity_matrix(self):
         """基于参数更新模式的相似度计算"""
@@ -312,130 +359,10 @@ class MyMethod(FedAvg):
 
 
 
-    def cluster_by_similarity(self, client_list, similarity_matrix, active_list, target_size=3):
-        """基于相似度对客户端进行聚类"""
-        if len(client_list) <= target_size:
-            return [client_list]
 
-        clusters = []
-        remaining = client_list.copy()
-
-        while len(remaining) > 0:
-            if len(remaining) <= target_size:
-                clusters.append(remaining)
-                break
-
-            # 选择第一个客户端作为种子
-            seed = remaining.pop(0)
-            current_cluster = [seed]
-
-            # 找到最相似的客户端加入当前聚类
-            while len(current_cluster) < target_size and len(remaining) > 0:
-                best_client = None
-                best_similarity = -1
-
-                for candidate in remaining:
-                    # 计算候选客户端与当前聚类的平均相似度
-                    avg_sim = 0
-                    for cluster_member in current_cluster:
-                        i = active_list.index(cluster_member)
-                        j = active_list.index(candidate)
-                        avg_sim += similarity_matrix[i][j]
-                    avg_sim /= len(current_cluster)
-
-                    if avg_sim > best_similarity:
-                        best_similarity = avg_sim
-                        best_client = candidate
-
-                if best_client:
-                    current_cluster.append(best_client)
-                    remaining.remove(best_client)
-                else:
-                    break
-
-            clusters.append(current_cluster)
-
-        return clusters
 #######################################################################################################################################
 
 
-    # def compute_parameter_similarity(self, client_i_id, client_j_id):
-    #     """基于模型参数计算相似度"""
-    #     if (client_i_id >= len(self.client_parameters_history) or
-    #             client_j_id >= len(self.client_parameters_history) or
-    #             len(self.client_parameters_history[client_i_id]) == 0 or
-    #             len(self.client_parameters_history[client_j_id]) == 0):
-    #         return 0.5  # 默认中等相似度
-    #
-    #     params_i = self.client_parameters_history[client_i_id][-1]
-    #     params_j = self.client_parameters_history[client_j_id][-1]
-    #
-    #     similarity = 0.0
-    #     total_params = 0
-    #
-    #     for key in params_i.keys():
-    #         if key in params_j and 'bn' not in key:
-    #             param_i_flat = params_i[key].flatten()
-    #             param_j_flat = params_j[key].flatten()
-    #
-    #             if param_i_flat.shape == param_j_flat.shape:
-    #                 cos_sim = F.cosine_similarity(param_i_flat.unsqueeze(0),
-    #                                               param_j_flat.unsqueeze(0))
-    #                 similarity += cos_sim.item() * param_i_flat.numel()
-    #                 total_params += param_i_flat.numel()
-    #
-    #     return similarity / total_params if total_params > 0 else 0.5
-
-
-    def perform_hierarchical_clustering(self, similarity_matrix):
-        """改进的金融场景层次聚类"""
-        active_list = list(self.active_clients_set)
-        fraud_rates = self.compute_client_fraud_rates()
-
-        # 按欺诈率分组
-        high_fraud_clients = []  # > 0.1 (10%)
-        medium_fraud_clients = []  # 0.02-0.1 (2%-10%)
-        low_fraud_clients = []  # < 0.02 (2%)
-
-        for client_id in active_list:
-            fraud_rate = fraud_rates[client_id]
-            if fraud_rate > 0.1:
-                high_fraud_clients.append(client_id)
-            elif fraud_rate > 0.02:
-                medium_fraud_clients.append(client_id)
-            else:
-                low_fraud_clients.append(client_id)
-
-        clusters = []
-
-        # 高欺诈率客户端：单独或两两配对
-        for i, client_id in enumerate(high_fraud_clients):
-            if i % 2 == 0 and i + 1 < len(high_fraud_clients):
-                clusters.append([high_fraud_clients[i], high_fraud_clients[i + 1]])
-            elif i == len(high_fraud_clients) - 1:
-                clusters.append([client_id])
-
-        # 中等欺诈率：3-4个一组
-        if len(medium_fraud_clients) > 0:
-            # 使用相似度进一步细分
-            medium_clusters = self.cluster_by_similarity(
-                medium_fraud_clients, similarity_matrix, active_list, target_size=3
-            )
-            clusters.extend(medium_clusters)
-
-        # 低欺诈率：可以组成较大cluster
-        if len(low_fraud_clients) > 0:
-            if len(low_fraud_clients) <= 6:
-                clusters.append(low_fraud_clients)
-            else:
-                # 分成两组
-                mid = len(low_fraud_clients) // 2
-                clusters.append(low_fraud_clients[:mid])
-                clusters.append(low_fraud_clients[mid:])
-
-        print(
-            f"欺诈率分布 - 高风险: {len(high_fraud_clients)}, 中风险: {len(medium_fraud_clients)}, 低风险: {len(low_fraud_clients)}")
-        return clusters
 
     def create_cluster_model(self, cluster_clients, base_layer):
         """为聚类创建模型"""
@@ -631,69 +558,9 @@ class MyMethod(FedAvg):
 
             if clients_to_remove:
                 print(f"移除表现不佳的客户端: {clients_to_remove}")
-#####################################################################################################################################################
-    #原版train!!!!!!!!!!!!!!!!!!!!
-    # def train(self):
-    #
-    #     self.structure[0][0] = [np.arange(self.num_clients), copy.deepcopy(self.global_model)]
-    #     for i in range(self.global_rounds+1):
-    #         s_t = time.time()     #记录本轮训练的时间消耗
-    #         self.selected_clients = self.select_clients()    #选择参与本轮训练的客户端
-    #         self.send_models_with_classifier()    #将全局模型发送给选中的客户端
-    #
-    #         if i%self.eval_gap == 0:         #eval_gap应该是评估间隔，如果轮数能被评估间隔整除，就进行一次模型评估
-    #             print(f"\n-------------Round number: {i}-------------")
-    #             print("\nEvaluate global model")
-    #             self.current_round = i
-    #             self.evaluate()
-    #
-    #         for client in self.selected_clients:
-    #             client.train(i,self.num_clients)
-    #
-    #         # threads = [Thread(target=client.train)
-    #         #            for client in self.selected_clients]
-    #         # [t.start() for t in threads]
-    #         # [t.join() for t in threads]
-    #
-    #         self.receive_models_with_classifier()        #从客户端接收模型参数
-    #         if self.dlg_eval and i%self.dlg_gap == 0:
-    #             self.call_dlg(i)
-    #         self.aggregate_parameters()
-    #         if self.early_stop:
-    #             print("Early Stopping Triggered at Round ",i)
-    #             break
-    #
-    #         self.Budget.append(time.time() - s_t)
-    #         print('-'*25, 'time cost', '-'*25, self.Budget[-1])
-    #
-    #         if self.auto_break and self.check_done(acc_lss=[self.rs_total_test_acc], top_cnt=self.top_cnt):
-    #             break
-    #
-    #     print("\nBest accuracy.")
-    #     # self.print_(max(self.rs_test_acc), max(
-    #     #     self.rs_train_acc), min(self.rs_train_loss))
-    #     print(max(self.rs_total_test_acc))
-    #     print("\nAverage time cost per round.")
-    #     print(sum(self.Budget[1:])/len(self.Budget[1:]))
-    #
-    #
-    #     for value in self.rs_total_test_acc:
-    #         self.rs_test_acc.append(value)
-    #     for value in self.rs_total_train_loss:
-    #         self.rs_train_loss.append(value)
-    #
-    #     self.save_results()
-    #     self.save_global_model()
-    #
-    #     self.plot_metrics()
-    #
-    #     if self.num_new_clients > 0:
-    #         self.eval_new_clients = True
-    #         self.set_new_clients(clientAVG)
-    #         print(f"\n-------------Fine tuning round-------------")
-    #         print("\nEvaluate new clients")
-    #         self.evaluate()
-#####################################################################################################################################################
+
+
+
     def send_models_with_classifier(self):
         assert (len(self.clients) > 0)  # 用assrt来确保客户端列表的客户端至少有一个，如果len(self.clients) > 0不成立那么程序就会终止运行并报错
 
@@ -965,12 +832,17 @@ class MyMethod(FedAvg):
         online_losses_list = []
         offline_losses_list = []
         total_losses_list = []
+        global_total_loss = 0
         for c in self.clients:
             online_losses, offline_losses, total_losses, train_num = c.train_metrics()  # 计算本批次总损失和训练的客户端数量
             num_samples.append(train_num)
             online_losses_list.append(online_losses * 1.0)
             offline_losses_list.append(offline_losses * 1.0)
             total_losses_list.append(total_losses * 1.0)
+
+            global_total_loss = global_total_loss + total_losses
+
+        self.global_loss = global_total_loss
 
         ids = [c.id for c in self.clients]
 
@@ -1407,3 +1279,134 @@ class MyMethod(FedAvg):
         except Exception:
             # 保守策略：异常时返回中等风险等级
             return 1
+
+#--------------------------------------------------------------------------------------------------------------------------------------------------
+    def compute_gradient_similarity(self, client_updates):
+        """计算客户端之间的梯度相似度"""
+        similarities = {}
+        client_ids = list(client_updates.keys())
+
+        for i, client_a in enumerate(client_ids):
+            similarities[client_a] = {}
+            grad_a = self.flatten_gradients(client_updates[client_a])
+
+            for j, client_b in enumerate(client_ids):
+                if i <= j:
+                    grad_b = self.flatten_gradients(client_updates[client_b])
+                    # 使用余弦相似度
+                    similarity = torch.cosine_similarity(grad_a.unsqueeze(0), grad_b.unsqueeze(0))
+                    similarities[client_a][client_b] = similarity.item()
+                    if client_b not in similarities:
+                        similarities[client_b] = {}
+                    similarities[client_b][client_a] = similarity.item()
+
+        return similarities
+
+    def flatten_gradients(self, model_params):
+        """将模型参数展平为一维向量"""
+        flattened = []
+        for name, param in model_params.items():
+            if isinstance(param, torch.Tensor) and param.requires_grad:
+                flattened.append(param.flatten())
+
+        if not flattened:
+            # 如果没有可训练参数，返回零向量
+            return torch.zeros(1, device=self.device)
+
+        return torch.cat(flattened)
+
+    def adaptive_layer_clustering(self, client_updates, layer_idx):
+        """自适应层级聚类"""
+        similarities = self.compute_gradient_similarity(client_updates)
+
+        # 根据层级调整相似度阈值
+        similarity_threshold = 0.8 - 0.1 * layer_idx  # 随层级递减
+
+        client_ids = list(client_updates.keys())
+        clusters = []
+        assigned = set()
+
+        for client_a in client_ids:
+            if client_a in assigned:
+                continue
+
+            cluster = [client_a]
+            assigned.add(client_a)
+
+            for client_b in client_ids:
+                if (client_b not in assigned and
+                        client_b in similarities[client_a] and
+                        similarities[client_a][client_b] > similarity_threshold):
+                    cluster.append(client_b)
+                    assigned.add(client_b)
+
+            clusters.append(cluster)
+
+        return clusters
+
+    def progressive_layer_training(self, layer_idx):
+        """渐进式层级训练，支持参数解冻"""
+        if layer_idx > 0:
+            # 部分解冻前一层参数，允许微调
+            prev_layer_params = f"classifier.{2 * (layer_idx - 1)}"  # 对应分类器层
+            for name, param in self.global_model.named_parameters():
+                if prev_layer_params in name:
+                    param.requires_grad = True  # 解冻允许微调
+                    # 使用更小的学习率
+                    param.lr_scale = 0.1
+
+        # 当前层正常训练
+        current_layer_params = f"classifier.{2 * layer_idx}"
+        for name, param in self.global_model.named_parameters():
+            if current_layer_params in name:
+                param.requires_grad = True
+                param.lr_scale = 1.0
+
+    def collect_client_updates(self):
+        """收集客户端模型更新用于聚类分析"""
+        updates = {}
+        for client in self.selected_clients:
+            updates[client.id] = {}
+            for name, param in client.model.named_parameters():
+                if param.requires_grad:
+                    updates[client.id][name] = param.data.clone()
+        return updates
+
+    def train_cluster_clients(self, cluster_clients, layer_idx, round_idx):
+        """训练聚类内的客户端"""
+        for client in cluster_clients:
+            # 设置自适应学习率
+            adaptive_lr = client.get_adaptive_lr()
+            for param_group in client.optimizer.param_groups:
+                param_group['lr'] = adaptive_lr
+            print(f"客户端 {client.id}: 自适应学习率 {adaptive_lr:.6f}")
+
+            # 训练客户端
+            client.train_layer_specific(layer_idx, round_idx, len(cluster_clients))
+
+            # 更新学习率历史信息
+            training_loss = getattr(client, 'training_loss', 1.0)
+            global_loss = getattr(self, 'global_loss', 1.0)
+            client.update_lr_history(training_loss, global_loss, round_idx)
+
+    def aggregate_cluster(self, models, clients):
+        """聚合聚类内的模型更新"""
+        # 使用FedAvg方式聚合
+        global_dict = self.global_model.state_dict()
+
+        for key in global_dict.keys():
+            if any(key in model.state_dict() for model in models):
+                global_dict[key] = torch.stack([
+                    model.state_dict()[key] * (len(client.train_samples) /
+                                               sum(len(c.train_samples) for c in clients))
+                    for model, client in zip(models, clients)
+                    if key in model.state_dict()
+                ]).sum(0)
+
+        self.global_model.load_state_dict(global_dict)
+
+
+# --------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+

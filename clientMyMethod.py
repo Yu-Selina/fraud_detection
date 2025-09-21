@@ -42,9 +42,15 @@ class clientMyMethod(clientAVG):
 
         self.offline_loss = get_weighted_bce()
 
+        # 单向Teacher-Student参数
+        self.momentum_tau = getattr(args, 'momentum_tau', 0.99)  # 动量系数
+        self.temperature = getattr(args, 'temperature', 4.0)  # 温度参数
+        self.alpha = getattr(args, 'distill_alpha', 0.7)  # 蒸馏权重
 
-        # self.loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        # self.offline_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        # 初始化Teacher模型（动量更新）
+        self.teacher_model = copy.deepcopy(self.model)
+        for param in self.teacher_model.parameters():
+            param.requires_grad = False
 
         # 更保守的优化器设置
         self.optimizer = torch.optim.Adam(
@@ -64,21 +70,6 @@ class clientMyMethod(clientAVG):
         self.classifier = copy.deepcopy(self.offline_model.classifier)
         self.other_classifier = {}
 
-        # —— INSERT —— 为 online/offline 各建一份 EMA 教师（不参与梯度）
-        self.online_teacher = copy.deepcopy(self.model)
-        self.offline_teacher = copy.deepcopy(self.offline_model)
-        for p in self.online_teacher.parameters():
-            p.requires_grad_(False)
-        for p in self.offline_teacher.parameters():
-            p.requires_grad_(False)
-
-        # —— INSERT —— EMA 衰减与蒸馏缓启（可从 args 读取，给默认值）
-        self.ema_tau = getattr(args, 'ema_tau', 0.99)
-        self.kd_warmup_rounds = getattr(args, 'kd_warmup_rounds', 10)
-
-        self.kd_temperature = getattr(args, 'kd_temperature', 4.0)
-        self.kd_alpha = getattr(args, 'kd_alpha', 0.7)
-        self.kd_beta = getattr(args, 'kd_beta', 0.3)
 
         # 改进学习率调度
         self.offline_learning_rate_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.offline_optimizer, T_0=10, T_mult=2, eta_min=1e-6)
@@ -88,9 +79,7 @@ class clientMyMethod(clientAVG):
         self.offline_learning_rate_decay = True
         self.learning_rate_decay_gamma = 0.98
 
-        self.temperature = 2.0   #温度系数
-        self.alpha_online = 0.7  # 在线模型的硬标签权重
-        self.alpha_offline = 0.7  # 离线模型的硬标签权重
+
 
         self.online_structure = {}  # 存每个层级的在线模型
         self.offline_structure = {} # 存每个层级的离线模型
@@ -103,6 +92,26 @@ class clientMyMethod(clientAVG):
         self.prev_loss = None
         self.detailed_logging = False
         self.local_analysis_done = False   #训练开始前调用本地数据分析
+
+        # 单向Teacher-Student参数
+        self.momentum_tau = getattr(args, 'momentum_tau', 0.99)
+        self.temperature = getattr(args, 'temperature', 4.0)
+        self.alpha = getattr(args, 'distill_alpha', 0.7)
+
+        # 自适应学习率相关参数（替代AdaptiveLRScheduler类）
+        self.base_lr = args.local_learning_rate
+        self.warmup_rounds = getattr(args, 'warmup_rounds', 5)
+        self.decay_factor = getattr(args, 'decay_factor', 0.95)
+        self.loss_history = []
+        self.convergence_rate = 1.0
+        self.current_round = 0
+        self.last_loss = 1.0
+        self.global_loss = 1.0
+
+        # 初始化Teacher模型
+        self.teacher_model = copy.deepcopy(self.model)
+        for param in self.teacher_model.parameters():
+            param.requires_grad = False
 
 
 
@@ -141,75 +150,6 @@ class clientMyMethod(clientAVG):
 
         total_gradient_norm = 0.0  # 总梯度范数
         total_batches = 0  # 总批次数
-
-        if global_rounds != 0:  #双向知识蒸馏过程
-
-            # —— EDIT —— 本轮蒸馏缓启系数（供 compute_distillation_loss 使用）
-            self._current_kd_ramp = self._kd_ramp(global_rounds)
-
-            # last_online_model = copy.deepcopy(self.model)
-            # last_online_model.eval()
-            # last_offline_model = copy.deepcopy(self.offline_model)
-            # last_offline_model.eval()
-
-            for epoch in range(max_local_epochs):
-                for i, (x, y) in enumerate(
-                        trainloader):  # 也可以是for  x,y in trainloader： 区别只是原文中的可以获取每个训练批次的数据和索引，而注释里这个简化版只能直接获取每个批次的数据而不能取得对应的索引
-                    if type(x) == type([]):
-                        x[0] = x[0].to(self.device)
-                    else:
-                        x = x.to(self.device)
-                    y = y.to(self.device)
-                    if self.train_slow:
-                        time.sleep(0.1 * np.abs(np.random.rand()))
-
-
-                    online_output = self.model(x)
-                    offline_output = self.offline_model(x)
-
-                    # with torch.no_grad():
-                    #     last_online_output = last_online_model(x)
-                    #     last_offline_output = last_offline_model(x)
-
-
-                    # —— EDIT —— 教师来自 EMA，不参与梯度
-                    with torch.no_grad():
-                        last_online_output = self.online_teacher(x)
-                        last_offline_output = self.offline_teacher(x)
-
-                    self.optimizer.zero_grad()
-
-                    dist_online_loss, dist_offline_loss = self.compute_distillation_loss(online_output,offline_output,last_online_output,last_offline_output,y)
-
-                    # —— EDIT —— 交替更新：先在线
-                    mu = getattr(self, 'fedprox_mu', 0.0)
-
-                    if mu > 0:
-                        global_snapshot = getattr(self, 'initial_params', None)
-                        offline_snapshot = getattr(self, 'initial_offline_params', None)
-
-                        if global_snapshot is not None:
-                            prox_term = self.apply_fedprox_proximal(self.model, global_snapshot, mu)
-                            dist_online_loss = dist_online_loss + prox_term
-
-                        if offline_snapshot is not None:
-                            prox_term_off = self.apply_fedprox_proximal(self.offline_model, offline_snapshot, mu)
-                            dist_offline_loss = dist_offline_loss + prox_term_off
-                    self.optimizer.zero_grad()
-                    dist_online_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-                    self.optimizer.step()
-
-                    # 再离线
-                    self.offline_optimizer.zero_grad()
-                    dist_offline_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=0.5)
-                    self.offline_optimizer.step()
-
-                    # —— EDIT —— 每步后更新 EMA 教师
-                    self._ema_update(self.online_teacher, self.model)
-                    self._ema_update(self.offline_teacher, self.offline_model)
-
 
 
         for epoch in range(max_local_epochs):   #本地训练阶段
@@ -275,8 +215,7 @@ class clientMyMethod(clientAVG):
                 total_offline_loss.backward()
                 self.offline_optimizer.step()
 
-                self._ema_update(self.online_teacher, self.model)
-                self._ema_update(self.offline_teacher, self.offline_model)
+
 
                 # 累计总损失
                 sum_total_online_loss += total_online_loss.item()
@@ -356,89 +295,8 @@ class clientMyMethod(clientAVG):
         self.train_time_cost['total_cost'] += time.time() - start_time
 
 
-    def compute_distillation_loss(self,
-                                  current_online_output,  # 本轮在线模型输出 (batch,1)
-                                  current_offline_output,  # 本轮离线模型输出 (batch,1)
-                                  last_online_output,  # 上一轮在线模型输出 (batch,1)
-                                  last_offline_output,  # 上一轮离线模型输出 (batch,1)
-                                  labels):
-        """跨轮次的双向知识蒸馏（二分类 + BCEWithLogitsLoss版本）"""
-        labels = labels.float().view(-1)
-
-        # 硬标签
-        online_hard = self.loss(current_online_output, labels)
-        offline_hard = self.offline_loss(current_offline_output, labels)
-
-        # 软标签：teacher 概率（logit/T 后过 sigmoid）
-        T = self.temperature
-        with torch.no_grad():
-            t_offline_prob = torch.sigmoid(last_offline_output / T)
-            t_online_prob = torch.sigmoid(last_online_output / T)
-
-        online_soft = F.binary_cross_entropy_with_logits(
-            current_online_output / T, t_offline_prob, reduction='mean'
-        ) * (T ** 2)
-
-        offline_soft = F.binary_cross_entropy_with_logits(
-            current_offline_output / T, t_online_prob, reduction='mean'
-        ) * (T ** 2)
-
-        ao = getattr(self, 'alpha_online', 0.7)
-        af = getattr(self, 'alpha_offline', 0.7)
-
-        # —— EDIT —— 蒸馏项乘以缓启系数
-        ramp = getattr(self, '_current_kd_ramp', 1.0)
-        total_online_loss = ao * online_hard + ramp * (1 - ao) * online_soft
-        total_offline_loss = af * offline_hard + ramp * (1 - af) * offline_soft
-        return total_online_loss, total_offline_loss
-        # # 1. 硬标签监督（BCEWithLogitsLoss）
-        # # labels = labels.float().view(-1, 1)
-        # labels = labels.float().view(-1)
-        # online_hard_loss = self.loss(current_online_output, labels)
-        # offline_hard_loss = self.offline_loss(current_offline_output, labels)
-        #
-        # # 2. 软标签蒸馏（基于 sigmoid 概率）
-        # T = self.temperature
-        #
-        # # 学生与教师的概率
-        # student_online_prob = torch.sigmoid(current_online_output / T)
-        # teacher_offline_prob = torch.sigmoid(last_offline_output.detach() / T)
-        #
-        # student_offline_prob = torch.sigmoid(current_offline_output / T)
-        # teacher_online_prob = torch.sigmoid(last_online_output.detach() / T)
-        #
-        # # KL 散度：这里我们用 log(p_student) vs p_teacher
-        # online_soft_loss = F.kl_div(
-        #     torch.log(student_online_prob + 1e-8),
-        #     teacher_offline_prob,
-        #     reduction="batchmean"
-        # ) * (T ** 2)
-        #
-        # offline_soft_loss = F.kl_div(
-        #     torch.log(student_offline_prob + 1e-8),
-        #     teacher_online_prob,
-        #     reduction="batchmean"
-        # ) * (T ** 2)
-        #
-        # # 3. 总损失
-        # total_online_loss = 0.5 * online_hard_loss + 0.5 * online_soft_loss
-        # total_offline_loss = 0.5 * offline_hard_loss + 0.5 * offline_soft_loss
 
 
-    def kl_loss_with_temperature(self, student_output, teacher_output, temperature):
-        """适配二分类单 logit 输出的 KL 散度损失"""
-
-        # 概率化（sigmoid + 温度缩放）
-        student_prob = torch.sigmoid(student_output / temperature)
-        teacher_prob = torch.sigmoid(teacher_output / temperature)
-
-        # 避免 log(0)
-        student_log_prob = torch.log(student_prob + 1e-8)
-
-        # KL(P_teacher || P_student)
-        loss = F.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
-
-        return loss * (temperature ** 2)
 
 
 
@@ -825,556 +683,12 @@ class clientMyMethod(clientAVG):
 
         return online_weight, offline_weight
 
-    # —— INSERT —— EMA 更新与蒸馏缓启系数
-    def _ema_update(self, teacher_model, student_model, tau=None):
-        teacher_model.to(self.device)
-        student_model.to(self.device)
-        tau = self.ema_tau if tau is None else tau
-        with torch.no_grad():
-            t_params = dict(teacher_model.named_parameters())
-            for n, p_s in student_model.named_parameters():
-                p_t = t_params[n]
-                p_t.data.mul_(tau).add_(p_s.detach().data, alpha=(1.0 - tau))
 
-    # —— INSERT —— EMA 更新与蒸馏缓启系数
-    def _kd_ramp(self, global_round_idx):
-        r = (global_round_idx + 1) / max(1, self.kd_warmup_rounds)
-        return float(min(1.0, max(0.0, r)))
 
 
 #######################################################################################################################################################
-    def train_layer_specific(self, layer, round_idx, num_clients):
-        """改进的层级特定训练方法"""
-        self.model.to(self.device)
-        self.offline_model.to(self.device)
 
-        # 确保结构化模型也在正确设备上
-        for layer_id, model in self.online_structure.items():
-            model.to(self.device)
-        for layer_id, model in self.offline_structure.items():
-            model.to(self.device)
 
-        # 确保EMA教师模型也在正确设备上
-        if hasattr(self, 'online_teacher'):
-            self.online_teacher.to(self.device)
-        if hasattr(self, 'offline_teacher'):
-            self.offline_teacher.to(self.device)
-
-        # 【新增】基于客户端欺诈特征的自适应学习率
-        fraud_count = self.get_local_fraud_count()
-        base_lr = self.learning_rate
-
-        if fraud_count == 0:
-            # 无欺诈样本：使用更保守的学习率
-            adaptive_lr = base_lr * 0.3
-            print(f"客户端 {self.id}: 无欺诈样本，使用保守学习率 {adaptive_lr:.6f}")
-        elif fraud_count > 1000:
-            # 大量欺诈样本：使用稍高的学习率
-            adaptive_lr = base_lr * 1.2
-            print(f"客户端 {self.id}: 高欺诈样本({fraud_count})，使用积极学习率 {adaptive_lr:.6f}")
-        else:
-            adaptive_lr = base_lr
-
-        # 创建自适应优化器
-        layer_focused_optimizer = self.create_adaptive_layer_optimizer(layer, adaptive_lr)
-        original_optimizer = self.optimizer
-        self.optimizer = layer_focused_optimizer
-
-        try:
-            if layer == 0:
-                self.train(round_idx, num_clients)
-            else:
-                # self.train_with_improved_layer_fusion(layer, round_idx, num_clients)
-                self.train(round_idx,num_clients)
-
-        except Exception as e:
-            print(f"客户端 {self.id} 在第 {layer} 层训练时出错: {e}")
-
-        finally:
-            self.optimizer = original_optimizer
-
-    def get_local_fraud_count(self):
-        """获取本地欺诈样本数量"""
-        if hasattr(self, 'local_fraud_count'):
-            return self.local_fraud_count
-
-        # 如果没有缓存，快速计算一次
-        fraud_counts = {
-            0: 0, 1: 2000, 2: 718, 3: 0, 4: 1124, 5: 2452, 6: 2080, 7: 89,
-            8: 0, 9: 0, 10: 297, 11: 0, 12: 0, 13: 114, 14: 497, 15: 0,
-            16: 0, 17: 5186, 18: 946, 19: 5160
-        }
-        self.local_fraud_count = fraud_counts.get(self.id, 0)
-        return self.local_fraud_count
-
-    def create_adaptive_layer_optimizer(self, current_layer, adaptive_lr):
-        """创建自适应层级优化器"""
-        # 简化版本，直接使用调整后的学习率
-        return torch.optim.Adam(
-            self.model.parameters(),
-            lr=adaptive_lr,
-            weight_decay=1e-4 if self.get_local_fraud_count() > 0 else 1e-3
-        )
-
-    def train_with_improved_layer_fusion(self, layer, round_idx, num_clients):
-        """改进的层级融合训练"""
-        trainloader = self.load_train_data()
-        self.model.train()
-        self.offline_model.train()
-
-        start_time = time.time()
-        total_loss = 0.0
-        batch_count = 0
-
-        for epoch in range(self.local_epochs):
-            for i, (x, y) in enumerate(trainloader):
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)
-                else:
-                    x = x.to(self.device)
-                y = y.to(self.device)
-
-                # 当前层输出
-                online_feature = self.model.produce_feature(x)
-                online_output = self.model.classifier(online_feature).squeeze(1)
-                offline_feature = self.offline_model.produce_feature(x)
-                offline_output = self.offline_model.classifier(offline_feature).squeeze(1)
-
-                # 【改进】基于理论的层级融合
-                if layer > 0:
-                    fused_online, fused_offline = self.compute_theory_based_layer_fusion(x, layer)
-
-                    # 【新增】基于统计的自适应权重
-                    current_stats = self.compute_output_statistics(online_output, offline_output)
-                    historical_stats = self.compute_output_statistics(fused_online, fused_offline)
-
-                    current_weight, historical_weight = self.calculate_adaptive_weights(current_stats, historical_stats)
-
-                    final_online_output = current_weight * online_output + historical_weight * fused_online
-                    final_offline_output = current_weight * offline_output + historical_weight * fused_offline
-
-                    # 监控权重分配
-                    if i == 0 and epoch == 0:
-                        print(
-                            f"客户端 {self.id} 层 {layer}: Current权重={current_weight:.3f}, Historical权重={historical_weight:.3f}")
-                        if historical_weight > 0.7:
-                            print(f"  ⚠️ High historical reliance")
-                else:
-                    final_online_output = online_output
-                    final_offline_output = offline_output
-
-                y = y.float().view(-1).to(self.device)
-
-                # 计算损失
-                online_loss = self.loss(final_online_output, y)
-                offline_loss = self.offline_loss(final_offline_output, y)
-
-                # 参数更新
-                self.optimizer.zero_grad()
-                online_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-
-                self.offline_optimizer.zero_grad()
-                offline_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=1.0)
-                self.offline_optimizer.step()
-
-                # EMA更新
-                self._ema_update(self.online_teacher, self.model)
-                self._ema_update(self.offline_teacher, self.offline_model)
-
-                total_loss += online_loss.item() + offline_loss.item()
-                batch_count += 1
-
-        # 记录训练损失用于相似度计算
-        if batch_count > 0:
-            self.current_train_loss = total_loss / batch_count
-
-        self.train_time_cost['num_rounds'] += 1
-        self.train_time_cost['total_cost'] += time.time() - start_time
-
-
-
-    def compute_output_statistics(self, output1, output2):
-        """计算输出的统计特征"""
-        with torch.no_grad():
-            combined = torch.cat([output1, output2])
-            return torch.mean(combined).item(), torch.std(combined).item()
-
-    def calculate_adaptive_weights(self, current_stats, historical_stats):
-        """基于统计特征计算自适应权重"""
-        current_mean, current_std = current_stats
-        historical_mean, historical_std = historical_stats
-
-        # 如果当前输出稳定且合理，增加当前权重
-        if abs(current_mean) < 2.0 and current_std < 1.0:
-            current_weight = 0.8
-        elif abs(current_mean) > 5.0 or current_std > 3.0:
-            # 当前输出不稳定，依赖历史
-            current_weight = 0.2
-        else:
-            current_weight = 0.6
-
-        historical_weight = 1.0 - current_weight
-        return current_weight, historical_weight
-
-    def compute_theory_based_layer_fusion(self, x, current_layer):
-        """基于理论的层级融合输出计算"""
-        fused_online = torch.zeros(x.size(0), device=self.device)
-        fused_offline = torch.zeros(x.size(0), device=self.device)
-
-        total_weight = 0.0
-
-        for layer_id in range(current_layer):
-            if layer_id in self.online_structure and layer_id in self.offline_structure:
-                with torch.no_grad():
-                    online_model = self.online_structure[layer_id]
-                    offline_model = self.offline_structure[layer_id]
-
-                    layer_online_out = online_model(x).squeeze()
-                    layer_offline_out = offline_model(x).squeeze()
-
-                    # 处理输出维度
-                    layer_online_out = self.process_model_output(layer_online_out)
-                    layer_offline_out = self.process_model_output(layer_offline_out)
-
-                    # 层级权重：更深的层权重更高
-                    layer_weight = (layer_id + 1) / current_layer
-
-                    # 检查数值稳定性
-                    if (torch.abs(layer_online_out).max() < 10 and
-                            torch.abs(layer_offline_out).max() < 10):
-                        fused_online += layer_weight * layer_online_out
-                        fused_offline += layer_weight * layer_offline_out
-                        total_weight += layer_weight
-
-        # 归一化
-        if total_weight > 0:
-            fused_online /= total_weight
-            fused_offline /= total_weight
-
-        return fused_online, fused_offline
-
-    def train_with_layer_fusion(self, layer, round_idx, num_clients):
-        """基于研究的层级融合训练"""
-        trainloader = self.load_train_data()
-        self.model.to(self.device)
-        self.offline_model.to(self.device)
-
-        # 确保历史结构模型在正确设备上
-        for layer_id in self.online_structure:
-            self.online_structure[layer_id].to(self.device)
-        for layer_id in self.offline_structure:
-            self.offline_structure[layer_id].to(self.device)
-
-        self.model.train()
-        self.offline_model.train()
-        start_time = time.time()
-
-        for epoch in range(self.local_epochs):
-            for i, (x, y) in enumerate(trainloader):
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)
-                else:
-                    x = x.to(self.device)
-                y = y.to(self.device)
-
-                # 当前层输出
-                online_feature = self.model.produce_feature(x)
-                online_output = self.model.classifier(online_feature).squeeze(1)
-                offline_feature = self.offline_model.produce_feature(x)
-                offline_output = self.offline_model.classifier(offline_feature).squeeze(1)
-
-                # 使用研究基础的自适应融合
-                if layer > 0:
-                    fused_online_output, fused_offline_output = self.compute_layer_fusion_output(x, layer)
-
-                    # 【新增】自适应权重计算
-                    adaptive_weights = self.compute_adaptive_fusion_weights(
-                        online_output, offline_output, fused_online_output, fused_offline_output
-                    )
-
-                    final_online_output = (adaptive_weights['current'] * online_output +
-                                           adaptive_weights['historical'] * fused_online_output)
-                    final_offline_output = (adaptive_weights['current'] * offline_output +
-                                            adaptive_weights['historical'] * fused_offline_output)
-
-                    # 监控融合效果
-                    if i == 0 and epoch == 0:
-                        self.log_research_based_fusion_effects(
-                            layer, online_output, offline_output,
-                            fused_online_output, fused_offline_output, adaptive_weights
-                        )
-                else:
-                    final_online_output = online_output
-                    final_offline_output = offline_output
-
-                y = y.float().view(-1).to(self.device)
-
-                # 计算损失
-                online_base_loss = self.loss(final_online_output, y)
-                offline_base_loss = self.offline_loss(final_offline_output, y)
-
-                # 基于研究的一致性损失
-                if layer > 0:
-                    # 为online损失计算一致性损失
-                    online_consistency_loss = self.compute_online_consistency_loss(
-                        online_output, offline_output.detach(), fused_online_output, fused_offline_output.detach()
-                    )
-
-                    # 为offline损失计算一致性损失（重新计算融合输出避免计算图冲突）
-                    fused_online_output_detached, fused_offline_output_for_offline = self.compute_layer_fusion_output(x,
-                                                                                                                      layer)
-                    offline_consistency_loss = self.compute_offline_consistency_loss(
-                        online_output.detach(), offline_output, fused_online_output_detached.detach(),
-                        fused_offline_output_for_offline
-                    )
-
-                    # 动态一致性权重
-                    consistency_weight = 0.05 + 0.15 * (layer / self.max_layers if hasattr(self, 'max_layers') else 0.1)
-
-                    online_loss = online_base_loss + consistency_weight * online_consistency_loss
-                    offline_loss = offline_base_loss + consistency_weight * offline_consistency_loss
-                else:
-                    online_loss = online_base_loss
-                    offline_loss = offline_base_loss
-
-                # 参数更新
-                self.optimizer.zero_grad()
-                online_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-
-                self.offline_optimizer.zero_grad()
-                offline_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=1.0)
-                self.offline_optimizer.step()
-
-                # EMA更新
-                self._ema_update(self.online_teacher, self.model)
-                self._ema_update(self.offline_teacher, self.offline_model)
-
-        # 异常检测
-        self.model.eval()
-        self.offline_model.eval()
-
-        with torch.no_grad():
-            test_loader = self.load_train_data()
-            test_batch_x, test_batch_y = next(iter(test_loader))
-
-            if type(test_batch_x) == type([]):
-                test_batch_x[0] = test_batch_x[0].to(self.device)
-            else:
-                test_batch_x = test_batch_x.to(self.device)
-            test_batch_y = test_batch_y.to(self.device)
-
-            online_feature = self.model.produce_feature(test_batch_x)
-            online_output = self.model.classifier(online_feature).squeeze(1)
-            offline_feature = self.offline_model.produce_feature(test_batch_x)
-            offline_output = self.offline_model.classifier(offline_feature).squeeze(1)
-
-            if layer > 0:
-                fused_online_output, fused_offline_output = self.compute_layer_fusion_output(test_batch_x, layer)
-                adaptive_weights = self.compute_adaptive_fusion_weights(
-                    online_output, offline_output, fused_online_output, fused_offline_output
-                )
-                final_online_output = (adaptive_weights['current'] * online_output +
-                                       adaptive_weights['historical'] * fused_online_output)
-                final_offline_output = (adaptive_weights['current'] * offline_output +
-                                        adaptive_weights['historical'] * fused_offline_output)
-            else:
-                final_online_output = online_output
-                final_offline_output = offline_output
-
-            test_batch_y = test_batch_y.float().view(-1).to(self.device)
-
-            online_loss = self.loss(final_online_output, test_batch_y).item()
-            offline_loss = self.offline_loss(final_offline_output, test_batch_y).item()
-
-            online_pred = torch.sigmoid(final_online_output) > 0.5
-            offline_pred = torch.sigmoid(final_offline_output) > 0.5
-
-            online_acc = (online_pred == test_batch_y).float().mean().item()
-            offline_acc = (offline_pred == test_batch_y).float().mean().item()
-
-            anomaly = self.check_anomaly(online_loss, offline_loss, online_acc, offline_acc)
-
-            if anomaly:
-                print(f"[CLIENT {self.id}] Layer {layer} - Round {round_idx} ⚠️ ANOMALY")
-                print(f"  Online: Loss={online_loss:.3f}, Acc={online_acc:.3f}")
-                print(f"  Offline: Loss={offline_loss:.3f}, Acc={offline_acc:.3f}")
-
-        self.model.train()
-        self.offline_model.train()
-
-        self.train_time_cost['num_rounds'] += 1
-        self.train_time_cost['total_cost'] += time.time() - start_time
-
-    def compute_adaptive_fusion_weights(self, current_online, current_offline, fused_online, fused_offline):
-        """基于输出质量的自适应融合权重"""
-        with torch.no_grad():
-            # 计算输出统计特征
-            current_online_std = torch.std(current_online).item()
-            current_offline_std = torch.std(current_offline).item()
-            fused_online_std = torch.std(fused_online).item()
-            fused_offline_std = torch.std(fused_offline).item()
-
-            # 计算相对贡献度
-            online_contrib = abs(torch.mean(fused_online).item()) / (abs(torch.mean(current_online).item()) + 1e-8)
-            offline_contrib = abs(torch.mean(fused_offline).item()) / (abs(torch.mean(current_offline).item()) + 1e-8)
-
-            # 自适应权重策略
-            if online_contrib < 0.01 and offline_contrib < 0.01:
-                # 历史贡献极小
-                historical_weight = 0.05
-            elif current_online_std > fused_online_std * 3:
-                # 当前输出不稳定，增加历史权重
-                historical_weight = 0.6
-            else:
-                # 正常情况，基于贡献度调整
-                historical_weight = 0.2 + 0.3 * min(online_contrib, offline_contrib)
-
-            current_weight = 1.0 - historical_weight
-
-            return {
-                'current': current_weight,
-                'historical': historical_weight
-            }
-
-    def compute_research_based_consistency_loss(self, online_output, offline_output, fused_online, fused_offline):
-        """基于研究的一致性损失"""
-        # 特征级一致性
-        feature_consistency = F.mse_loss(online_output, offline_output.detach())
-
-        # 融合一致性
-        fusion_consistency_online = F.mse_loss(online_output, fused_online.detach())
-        fusion_consistency_offline = F.mse_loss(offline_output, fused_offline.detach())
-
-        return (feature_consistency + fusion_consistency_online + fusion_consistency_offline) / 3
-
-    def log_research_based_fusion_effects(self, layer, online_output, offline_output,
-                                          fused_online, fused_offline, adaptive_weights):
-        """基于研究的融合效果监控"""
-        with torch.no_grad():
-            online_stats = {
-                'mean': torch.mean(online_output).item(),
-                'std': torch.std(online_output).item(),
-                'range': (torch.min(online_output).item(), torch.max(online_output).item())
-            }
-
-            fused_stats = {
-                'mean': torch.mean(fused_online).item(),
-                'std': torch.std(fused_online).item(),
-                'range': (torch.min(fused_online).item(), torch.max(fused_online).item())
-            }
-
-            contribution_ratio = abs(fused_stats['mean']) / (
-                        abs(online_stats['mean']) + abs(fused_stats['mean']) + 1e-8)
-
-            print(f"Client {self.id} Layer {layer} [Research-Based Analysis]:")
-            print(f"  Current: mean={online_stats['mean']:.3f}, std={online_stats['std']:.3f}")
-            print(f"  Historical: mean={fused_stats['mean']:.3f}, std={fused_stats['std']:.3f}")
-            print(
-                f"  Adaptive weights: Current={adaptive_weights['current']:.3f}, Historical={adaptive_weights['historical']:.3f}")
-            print(f"  Historical contribution: {contribution_ratio:.3f}")
-
-            # 基于研究的诊断
-            if contribution_ratio < 0.01:
-                print(f"  ✓ Minimal historical impact - appropriate weight reduction")
-            elif adaptive_weights['historical'] > 0.5:
-                print(f"  ⚠️  High historical reliance - check current layer stability")
-
-    def compute_layer_fusion_output(self, x, current_layer):
-        """基于FuseFL理论的渐进式层级融合"""
-        fused_online = torch.zeros(x.size(0), device=self.device)
-        fused_offline = torch.zeros(x.size(0), device=self.device)
-
-        # 【FuseFL核心】按自底向上方式渐进融合
-        layer_contributions_online = []
-        layer_contributions_offline = []
-        layer_weights = []
-
-        # 收集所有历史层输出
-        for layer_id in range(current_layer):
-            if layer_id in self.online_structure and layer_id in self.offline_structure:
-                with torch.no_grad():
-                    online_model = self.online_structure[layer_id]
-                    offline_model = self.offline_structure[layer_id]
-
-                    layer_online_out = online_model(x).squeeze()
-                    layer_offline_out = offline_model(x).squeeze()
-
-                    # 处理维度（保持原有逻辑）
-                    layer_online_out = self.process_model_output(layer_online_out)
-                    layer_offline_out = self.process_model_output(layer_offline_out)
-
-                    layer_contributions_online.append(layer_online_out)
-                    layer_contributions_offline.append(layer_offline_out)
-
-                    # 【FuseFL核心】层级重要性权重：越深层权重越大
-                    layer_importance = (layer_id + 1) / current_layer
-                    layer_weights.append(layer_importance)
-
-        # 【新增】数值稳定性检查和归一化
-        if layer_contributions_online:
-            normalized_weights = self.normalize_layer_weights(
-                layer_weights, layer_contributions_online, layer_contributions_offline
-            )
-
-            # 加权融合
-            for online_out, offline_out, weight in zip(
-                    layer_contributions_online, layer_contributions_offline, normalized_weights
-            ):
-                fused_online += weight * online_out
-                fused_offline += weight * offline_out
-
-        return fused_online, fused_offline
-
-    def process_model_output(self, model_output):
-        """处理模型输出维度"""
-        if model_output.dim() == 2:
-            if model_output.shape[1] == 2:
-                return model_output[:, 1] - model_output[:, 0]
-            elif model_output.shape[1] == 1:
-                return model_output[:, 0]
-        return model_output
-
-    def normalize_layer_weights(self, raw_weights, online_outputs, offline_outputs):
-        """基于输出统计的权重归一化"""
-        normalized_weights = []
-
-        for i, (weight, online_out, offline_out) in enumerate(
-                zip(raw_weights, online_outputs, offline_outputs)
-        ):
-            # 计算输出的数值特征
-            online_magnitude = torch.abs(online_out).mean().item()
-            offline_magnitude = torch.abs(offline_out).mean().item()
-
-            # 数值过小的层降低权重
-            if online_magnitude < 0.01 and offline_magnitude < 0.01:
-                adjusted_weight = weight * 0.1
-            elif online_magnitude > 10 or offline_magnitude > 10:
-                # 数值过大的层也降低权重
-                adjusted_weight = weight * 0.5
-            else:
-                adjusted_weight = weight
-
-            normalized_weights.append(adjusted_weight)
-
-        # 归一化权重和
-        total_weight = sum(normalized_weights)
-        if total_weight > 0:
-            normalized_weights = [w / total_weight for w in normalized_weights]
-
-        return normalized_weights
-
-    def compute_layer_consistency_loss(self, current_online, current_offline, fused_online, fused_offline):
-        """计算层级间一致性损失"""
-        # 计算当前层输出与融合输出的一致性
-        online_consistency = F.mse_loss(current_online, fused_online.detach())
-        offline_consistency = F.mse_loss(current_offline, fused_offline.detach())
-        return (online_consistency + offline_consistency) / 2
 
     def compute_relation_distillation(self, online_features, offline_features):
         """特征层面的关系蒸馏"""
@@ -1403,84 +717,7 @@ class clientMyMethod(clientAVG):
             print(f"关系蒸馏计算出错: {e}")
             return torch.tensor(0.0, device=online_features.device, requires_grad=True)
 
-    def create_layer_focused_optimizer(self, current_layer, base_lr=None):
-        """创建层级专注的优化器 - 使用渐进式学习率策略"""
-        if base_lr is None:
-            base_lr = self.learning_rate
 
-        if not hasattr(self.model, 'get_layer_parameters'):
-            # 如果是旧架构，使用标准优化器
-            return torch.optim.Adam(self.model.parameters(), lr=base_lr, weight_decay=1e-5)
-
-        layer_params = self.model.get_layer_parameters()
-        param_groups = []
-
-        for layer_idx, layer_modules in enumerate(layer_params):
-            # 收集该层的所有参数
-            layer_param_list = []
-            for module in layer_modules:
-                if isinstance(module, nn.Module):
-                    layer_param_list.extend(list(module.parameters()))
-                elif hasattr(module, '__iter__'):
-                    for m in module:
-                        if isinstance(m, nn.Module):
-                            layer_param_list.extend(list(m.parameters()))
-
-            # 设置学习率
-            if layer_idx < current_layer:
-                lr = base_lr * 0.01  # 已训练层：很小的学习率
-            elif layer_idx == current_layer:
-                lr = base_lr  # 当前训练层：正常学习率
-            else:
-                lr = base_lr * 0.1  # 未来层：中等学习率
-
-            if hasattr(self, 'anomaly_count') and self.anomaly_count > 3:
-                lr *= 0.5
-                if layer_idx == current_layer:  # 只在当前层打印日志
-                    print(
-                        f"Client {self.id}: Reducing LR for layer {current_layer} due to {self.anomaly_count} anomalies")
-
-            if layer_param_list:
-                param_groups.append({'params': layer_param_list, 'lr': lr})
-
-        return torch.optim.Adam(param_groups, weight_decay=1e-5)
-
-    def apply_gradual_learning_rates(self, optimizer, current_layer):
-        """为现有优化器应用渐进式学习率"""
-        if not hasattr(self.model, 'get_layer_parameters'):
-            return optimizer
-
-        layer_params = self.model.get_layer_parameters()
-        base_lr = self.learning_rate
-
-        # 重新设置参数组的学习率
-        param_idx = 0
-        for layer_idx, layer_modules in enumerate(layer_params):
-            # 计算该层参数数量
-            layer_param_count = 0
-            for module in layer_modules:
-                if isinstance(module, nn.Module):
-                    layer_param_count += len(list(module.parameters()))
-                elif hasattr(module, '__iter__'):
-                    for m in module:
-                        if isinstance(m, nn.Module):
-                            layer_param_count += len(list(m.parameters()))
-
-            # 设置学习率
-            if layer_idx < current_layer:
-                lr = base_lr * 0.01  # 已训练层：很小的学习率
-            elif layer_idx == current_layer:
-                lr = base_lr  # 当前训练层：正常学习率
-            else:
-                lr = base_lr * 0.1  # 未来层：中等学习率
-
-            # 更新优化器中对应参数组的学习率
-            for _ in range(layer_param_count):
-                if param_idx < len(optimizer.param_groups):
-                    optimizer.param_groups[param_idx]['lr'] = lr
-                    param_idx += 1
-
-        return optimizer
 
     def check_anomaly(self, online_loss, offline_loss, online_acc, offline_acc):
         # 根据训练轮数动态调整阈值
@@ -1503,28 +740,6 @@ class clientMyMethod(clientAVG):
             std_loss = np.std(self.loss_history[-5:])
             relative_threshold = avg_loss + 2 * std_loss  # 2倍标准差
             loss_threshold = min(loss_threshold, relative_threshold)
-
-    def compute_online_consistency_loss(self, online_output, offline_output_detached, fused_online,
-                                        fused_offline_detached):
-        """为online模型计算一致性损失"""
-        # 特征级一致性
-        feature_consistency = F.mse_loss(online_output, offline_output_detached)
-
-        # 融合一致性 - 只包含online相关的计算图
-        fusion_consistency = F.mse_loss(online_output, fused_online)
-
-        return (feature_consistency + fusion_consistency) / 2
-
-    def compute_offline_consistency_loss(self, online_output_detached, offline_output, fused_online_detached,
-                                         fused_offline):
-        """为offline模型计算一致性损失"""
-        # 特征级一致性
-        feature_consistency = F.mse_loss(offline_output, online_output_detached)
-
-        # 融合一致性 - 只包含offline相关的计算图
-        fusion_consistency = F.mse_loss(offline_output, fused_offline)
-
-        return (feature_consistency + fusion_consistency) / 2
 
 
     def log_gradient_norms(self):
@@ -1581,51 +796,6 @@ class clientMyMethod(clientAVG):
             self.local_fraud_rate = 0.05
             self.client_adaptation = "standard"
 
-    def log_fusion_effects(self, layer, online_output, offline_output, fused_online, fused_offline, batch_idx):
-        """监控融合效果"""
-        if not hasattr(self, 'fusion_logs'):
-            self.fusion_logs = []
-
-        with torch.no_grad():
-            # 计算当前层输出的统计信息
-            online_mean = torch.mean(online_output).item()
-            online_std = torch.std(online_output).item()
-
-            # 计算融合输出的统计信息
-            fused_mean = torch.mean(fused_online).item()
-            fused_std = torch.std(fused_online).item()
-
-            # 计算融合对最终输出的影响
-            final_before_fusion = online_output
-            final_after_fusion = 0.6 * online_output + 0.4 * fused_online
-
-            fusion_impact = torch.mean(torch.abs(final_after_fusion - final_before_fusion)).item()
-
-            # 计算历史层的贡献度
-            contribution_ratio = abs(fused_mean) / (abs(online_mean) + abs(fused_mean) + 1e-8)
-
-            log_entry = {
-                'layer': layer,
-                'batch': batch_idx,
-                'online_mean': online_mean,
-                'fused_mean': fused_mean,
-                'fusion_impact': fusion_impact,
-                'contribution_ratio': contribution_ratio,
-                'weight_effectiveness': fusion_impact / 0.4  # 0.4是融合权重
-            }
-
-            self.fusion_logs.append(log_entry)
-
-            # 每个层级每轮只分析一次
-            if batch_idx == 0:
-                print(f"Client {self.id} Layer {layer}: Fusion impact={fusion_impact:.4f}, "
-                      f"Historical contribution={contribution_ratio:.3f}")
-
-                # 如果融合影响过小，可能权重设置有问题
-                if fusion_impact < 0.001:
-                    print(f"  Warning: Very low fusion impact - consider adjusting weights")
-                elif fusion_impact > 0.5:
-                    print(f"  Warning: Very high fusion impact - may cause instability")
 
     def apply_fedprox_proximal(self, model, global_params_dict, mu):
         """
@@ -1686,3 +856,141 @@ class clientMyMethod(clientAVG):
             return 1
         else:
             return 2
+#----------------------------------------------------------------------------------------------------------------
+    def update_teacher_momentum(self):
+        """动量更新Teacher模型"""
+        with torch.no_grad():
+            for teacher_param, student_param in zip(
+                    self.teacher_model.parameters(),
+                    self.model.parameters()
+            ):
+                teacher_param.data = (
+                        self.momentum_tau * teacher_param.data +
+                        (1 - self.momentum_tau) * student_param.data
+                )
+
+    def compute_kd_loss(self, student_logits, teacher_logits, labels):
+        """计算单向知识蒸馏损失"""
+        # 硬标签损失
+        hard_loss = F.binary_cross_entropy_with_logits(student_logits, labels)
+
+        # 软标签损失（KL散度）
+        student_probs = torch.sigmoid(student_logits / self.temperature)
+        teacher_probs = torch.sigmoid(teacher_logits / self.temperature)
+
+        soft_loss = F.kl_div(
+            torch.log(student_probs + 1e-8),
+            teacher_probs,
+            reduction='batchmean'
+        ) * (self.temperature ** 2)
+
+        # 组合损失
+        total_loss = self.alpha * hard_loss + (1 - self.alpha) * soft_loss
+        return total_loss
+
+    def train_layer_specific(self, layer_idx, round_idx, num_clients):
+        """单向teacher-student架构的层级训练"""
+        trainloader = self.load_train_data()
+        self.model.train()
+        self.teacher_model.eval()
+
+        self.teacher_model.to(self.device)
+
+        # === 设置自适应学习率 ===
+        adaptive_lr = self.get_adaptive_lr()
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = adaptive_lr
+        print(f"客户端 {self.id}: 自适应学习率 {adaptive_lr:.6f}")
+
+        epoch_losses = []
+
+        # 本地训练轮次
+        for epoch in range(self.local_epochs):
+            batch_losses = []
+
+            for step, (x, y) in enumerate(trainloader):
+                if self.train_slow:
+                    time.sleep(0.1 * np.abs(np.random.rand()))
+
+                x, y = x.to(self.device), y.to(self.device).float()
+                if y.dim() > 1:
+                    y = y.squeeze()
+
+                # 学生模型前向传播
+                student_output = self.model(x)
+
+                # 教师模型前向传播（无梯度）
+                with torch.no_grad():
+                    teacher_output = self.teacher_model(x)
+
+                if student_output.dim() > 1:
+                    student_output = student_output.squeeze()
+                if teacher_output.dim() > 1:
+                    teacher_output = teacher_output.squeeze()
+
+                # 计算知识蒸馏损失
+                loss = self.compute_kd_loss(student_output, teacher_output, y)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+
+                # 梯度裁剪防止爆炸
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                self.optimizer.step()
+                batch_losses.append(loss.item())
+
+            epoch_loss = sum(batch_losses) / len(batch_losses)
+            epoch_losses.append(epoch_loss)
+
+            # 每个epoch结束后更新teacher
+            self.update_teacher_momentum()
+
+        # 计算平均训练损失并更新历史信息
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        self.training_loss = avg_loss  # 保存训练损失供服务器使用
+
+        # 注意：global_loss需要从服务器获取，这里暂时使用1.0
+        global_loss = getattr(self, 'received_global_loss', self.global_loss)
+        self.update_lr_history(avg_loss, global_loss, round_idx)
+
+        print(f"[CLIENT {self.id}] 第{layer_idx}层训练完成, 平均损失: {avg_loss:.4f}")
+
+    def get_adaptive_lr(self):
+        """基于性能自适应调整学习率"""
+        # Warmup阶段
+        if self.current_round < self.warmup_rounds:
+            return self.base_lr * (self.current_round + 1) / self.warmup_rounds
+
+        # 基于损失变化率调整
+        if len(self.loss_history) >= 2:
+            recent_change = abs(self.loss_history[-1] - self.loss_history[-2])
+            if recent_change < 0.01:  # 收敛缓慢
+                self.convergence_rate *= 1.1
+            elif recent_change > 0.5:  # 震荡过大
+                self.convergence_rate *= 0.8
+
+        # 基于全局-本地性能差异
+        performance_gap = abs(self.last_loss - self.global_loss) / (self.global_loss + 1e-8)
+        gap_factor = 1.0 + 0.2 * performance_gap
+
+        adaptive_lr = (self.base_lr *
+                       self.convergence_rate *
+                       gap_factor *
+                       (self.decay_factor ** (self.current_round - self.warmup_rounds)))
+
+        # 限制学习率范围
+        return max(1e-5, min(0.01, adaptive_lr))
+
+    def update_lr_history(self, loss_value, global_loss_value, round_idx):
+        """更新学习率调整所需的历史信息"""
+        self.loss_history.append(loss_value)
+        self.last_loss = loss_value
+        self.global_loss = global_loss_value
+        self.current_round = round_idx
+
+        # 只保留最近10次历史
+        if len(self.loss_history) > 10:
+            self.loss_history = self.loss_history[-10:]
+
+# ----------------------------------------------------------------------------------------------------------------
