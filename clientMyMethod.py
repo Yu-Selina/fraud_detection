@@ -80,10 +80,14 @@ class clientMyMethod(clientAVG):
         self.offline_learning_rate_decay = True
         self.learning_rate_decay_gamma = 0.98
 
-
-
-        self.online_structure = {}  # 存每个层级的在线模型
-        self.offline_structure = {} # 存每个层级的离线模型
+        self.online_structure = {
+            0: self.model.feature_extractor,
+            1: self.model.classifier
+        }
+        self.offline_structure = {
+            0: self.offline_model.feature_extractor,
+            1: self.offline_model.classifier
+        }
 
         self.relation_kd_weight = getattr(args, 'relation_kd_weight', 0.1)
         self.relation_kd_enabled = getattr(args, 'relation_kd_enabled', True)
@@ -292,11 +296,10 @@ class clientMyMethod(clientAVG):
 
 
 
-    def set_parameters_with_classifier(self, model,classifier_list,global_structure):
+    def set_parameters_with_classifier(self, global_structure, classifier_list, layer):
+        if layer in global_structure:
+            current_layer = global_structure[layer]
 
-        layers = [list(global_structure.keys())[-1]]
-        # for layer in layers:
-        current_layer = layers[-1]
         for group_id, group in global_structure[current_layer].items():
             if self.id in group[0]:
                 # self.online_structure[layer] = copy.deepcopy(group[1])
@@ -330,6 +333,11 @@ class clientMyMethod(clientAVG):
 
         self.initial_params = {name: param.data.clone().detach().to(self.device) for name, param in self.model.named_parameters()}
         self.initial_offline_params = {name: param.data.clone().detach().to(self.device)for name, param in self.offline_model.named_parameters()}
+
+        for key in self.online_structure.keys():
+            self.online_structure[key].to(self.device)
+        for key in self.offline_structure.keys():
+            self.offline_structure[key].to(self.device)
                     # if classifier_list != {}:
                     #     self.other_classifier = {}
                     #
@@ -352,316 +360,7 @@ class clientMyMethod(clientAVG):
         """添加特征一致性损失"""
         return F.mse_loss(online_features, offline_features.detach())
 
-    def test_metrics(self):
-        testloaderfull = self.load_test_data()  # 加载测试数据
-        # self.model = self.load_model('model')
-        # self.model.to(self.device)
-        self.model.to(self.device)
-        self.offline_model.to(self.device)
-        for layer, model in self.online_structure.items():
-            model.eval()
-        for layer, model in self.offline_structure.items():
-            model.eval()
-        self.model.eval()
-        self.offline_model.eval()
 
-        online_test_correct_num = 0  # 测试准确的数量
-        offline_test_correct_num = 0
-        total_test_correct_num = 0
-        test_num = 0  # 样本数
-        y_prob = []  # 预测结果列表
-        y_true = []  # 真实标签列表
-
-
-        with torch.no_grad():
-            for x, y in testloaderfull:
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)  # 如果x是列表形式，那么就输出列表的第一个输入源的数据
-                else:
-                    x = x.to(self.device)  # 将输入数据x移动到设备上（默认是GPU）
-                y = y.to(self.device)  # 将标签y移动到设备上（默认是GPU）
-
-
-                total_online_output = None
-                online_model_count = 0
-
-                for layer, online_model in self.online_structure.items():
-                    online_output = online_model(x).squeeze()
-
-                    if online_output.dim() == 2:
-                        if online_output.shape[1] == 2:
-                            online_output = online_output[:, 1] - online_output[:, 0]
-                        elif online_output.shape[1] == 1:
-                            online_output = online_output[:, 0]
-                        else:
-                            raise ValueError(
-                                f"Unexpected output shape {online_output.shape} for binary classification.")
-
-                    # 确保是1D tensor
-                    online_output = online_output.view(-1).to(self.device)
-
-                    # 安全的累积方式
-                    if total_online_output is None:
-                        total_online_output = online_output.clone()
-                    else:
-                        total_online_output += online_output
-
-                    online_model_count += 1
-
-                # 计算平均值
-                if online_model_count > 0:
-                    total_online_output = total_online_output / float(online_model_count)
-
-                total_offline_output = None
-                offline_model_count = 0
-
-                for layer, offline_model in self.offline_structure.items():
-                    offline_output = offline_model(x).squeeze()
-
-                    if offline_output.dim() == 2:
-                        if offline_output.shape[1] == 2:
-                            offline_output = offline_output[:, 1] - offline_output[:, 0]
-                        elif offline_output.shape[1] == 1:
-                            offline_output = offline_output[:, 0]
-                        else:
-                            raise ValueError(
-                                f"Unexpected output shape {offline_output.shape} for binary classification.")
-
-                    # 确保是1D tensor
-                    offline_output = offline_output.view(-1).to(self.device)
-
-                    # 安全的累积方式
-                    if total_offline_output is None:
-                        total_offline_output = offline_output.clone()
-                    else:
-                        total_offline_output += offline_output
-
-                    offline_model_count += 1
-
-                # 计算平均值
-                if offline_model_count > 0:
-                    total_offline_output = total_offline_output / float(offline_model_count)
-
-
-                # 确保y的维度正确
-                y_targets = y.float().view(-1)
-                # 检查并修正batch size不匹配问题
-                if total_online_output.size(0) != y_targets.size(0):
-                    # 如果batch size不匹配，截取或填充到匹配的大小
-                    min_batch_size = min(total_online_output.size(0), y_targets.size(0))
-                    total_online_output = total_online_output[:min_batch_size]
-                    y_targets = y_targets[:min_batch_size]
-                online_loss = self.loss(total_online_output, y_targets)
-
-                # 同样的检查和修正
-                if total_offline_output.size(0) != y_targets.size(0):
-                    min_batch_size = min(total_offline_output.size(0), y_targets.size(0))
-                    total_offline_output = total_offline_output[:min_batch_size]
-                    # y_targets已经在上面处理过了，这里需要重新获取
-                    y_targets_offline = y.float().view(-1)[:min_batch_size]
-                else:
-                    y_targets_offline = y_targets
-                offline_loss = self.offline_loss(total_offline_output, y_targets_offline)
-
-            #根据loss动态分配online和offline输出的权重占比
-##################################################################################################################################################################
-                # # 这里的online_weight、offline_weight是用于监测在测试集上的表现，self.online_weight等带self的则是在训练集上的表现
-                # online_weight, offline_weight = self.compute_dynamic_weights(online_loss, offline_loss)
-                # total_output = online_weight * online_output.detach() + offline_weight * offline_output.detach()
-                # if self.id == 1:
-                #     print("Client", self.id,
-                #           " Test metrics - Online_loss:", online_loss.item(),
-                #           " Offline_loss:", offline_loss.item(),
-                #           " Online_weight:", online_weight.item(),
-                #           " Offline_weight:", offline_weight.item())
-##################################################################################################################################################################
-
-
-            #后续考虑根据层级递增逐渐增加offline输出占比，降低online输出占比
-##################################################################################################################################################################
-                # total_output = (total_online_output + total_offline_output) / 2
-                #
-                # preds = torch.argmax(total_output, dim=1)  # [batch] 预测类别，原代码是用 argmax，这是不需要的，因为只有两个类别（非欺诈/欺诈）
-                total_output = (total_online_output + total_offline_output) / 2
-                # —— EDIT —— 分开统计 online/offline，再统计 fused
-                online_probs = torch.sigmoid(total_online_output)
-                offline_probs = torch.sigmoid(total_offline_output)
-                fused_probs = torch.sigmoid(total_output)
-
-                # 为离线模型使用更低的阈值（更容易预测为正类）
-                offline_threshold = 0.3  # 默认是0.5
-                online_preds = (online_probs > 0.5).long()
-                offline_preds = (offline_probs > offline_threshold).long()  # 降低阈值
-                fused_preds = (fused_probs > 0.4).long()  # 融合模型也稍微降低阈值
-
-                online_test_correct_num += (online_preds == y).sum().item()
-                offline_test_correct_num += (offline_preds == y).sum().item()
-                total_test_correct_num += (fused_preds == y).sum().item()
-
-
-                test_num += y.shape[0]  # 将y的行数，也就是当前批次（batch）的标签数量 加到test_num中，以此来统计标签数，也就是样本数
-
-                # —— EDIT —— 回传“在线概率”，与聚合/主监控一致
-                y_prob.append(online_probs.detach().cpu().numpy())
-
-
-                labels_np = y.detach().cpu().numpy()
-                y_true.append(np.eye(self.num_classes)[labels_np])
-
-        # self.model.cpu()
-        # self.save_model(self.model, 'model')
-
-        y_prob = np.concatenate(y_prob, axis=0)  # 将多个训练批次的预测结果连接起来，变成一个数组（原本是一个列表，里面每一个元素都是一个训练批次的预测结果）
-        y_true = np.concatenate(y_true, axis=0)  # 将多个训练批次的真实标签连接起来，变成一个数组（原本是一个列表，里面每一个元素都是一个训练批次的真实标签）
-
-        labels_flat = np.argmax(y_true, axis=1)  # 转回标签向量
-
-        if len(np.unique(labels_flat)) < 2:
-            auc = float('nan')
-        else:
-            auc = metrics.roc_auc_score(labels_flat, y_prob)
-
-        return online_test_correct_num, offline_test_correct_num, total_test_correct_num, test_num, auc, y_true, y_prob
-
-
-    def train_metrics(self):
-        trainloader = self.load_train_data()    #加载训练数据
-        # self.model = self.load_model('model')
-        # self.model.to(self.device)
-
-        for layer, model in self.online_structure.items():
-            model.eval()
-        for layer, model in self.offline_structure.items():
-            model.eval()
-
-        self.model.eval()         #模型进入评估模式
-        self.offline_model.eval()
-
-        train_num = 0
-        online_losses = 0
-        offline_losses = 0
-        total_losses = 0
-        with torch.no_grad():
-            for x, y in trainloader:
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)      #如果x是列表形式，那么就输出列表的第一个输入源的数据到默认设备上（默认是GPU）
-                else:
-                    x = x.to(self.device)      #将输入数据x移动到设备上（默认是GPU）
-                y = y.to(self.device)          #将真实标签y移动到设备上（默认是GPU）
-
-                total_online_output = None
-                online_model_count = 0
-
-                for layer, online_model in self.online_structure.items():
-                    online_output = online_model(x).squeeze()
-                    if online_output.dim() == 2:
-                        if online_output.shape[1] == 2:
-                            online_output = online_output[:, 1] - online_output[:, 0]
-                        elif online_output.shape[1] == 1:
-                            online_output = online_output[:, 0]
-                        else:
-                            raise ValueError(
-                                f"Unexpected output shape {online_output.shape} for binary classification.")
-
-                    # 确保是1D tensor
-                    online_output = online_output.view(-1).to(self.device)
-
-                    # 安全的累积方式
-                    if total_online_output is None:
-                        total_online_output = online_output.clone()
-                    else:
-                        total_online_output += online_output
-
-                    online_model_count += 1
-
-                # 计算平均值
-                if online_model_count > 0:
-                    total_online_output = total_online_output / float(online_model_count)
-
-
-
-                total_offline_output = None
-                offline_model_count = 0
-
-                for layer, offline_model in self.offline_structure.items():
-                    offline_output = offline_model(x).squeeze()
-                    if offline_output.dim() == 2:
-                        if offline_output.shape[1] == 2:
-                            offline_output = offline_output[:, 1] - offline_output[:, 0]
-                        elif offline_output.shape[1] == 1:
-                            offline_output = offline_output[:, 0]
-                        else:
-                            raise ValueError(
-                                f"Unexpected output shape {offline_output.shape} for binary classification.")
-
-                    # 确保是1D tensor
-                    offline_output = offline_output.view(-1).to(self.device)
-
-                    # 安全的累积方式
-                    if total_offline_output is None:
-                        total_offline_output = offline_output.clone()
-                    else:
-                        total_offline_output += offline_output
-
-                    offline_model_count += 1
-
-                # 计算平均值
-                if offline_model_count > 0:
-                    total_offline_output = total_offline_output / float(offline_model_count)
-
-                # 确保y的维度正确
-                y_targets = y.float().view(-1)
-                # 检查并修正batch size不匹配问题
-                if total_online_output.size(0) != y_targets.size(0):
-                    # 如果batch size不匹配，截取或填充到匹配的大小
-                    min_batch_size = min(total_online_output.size(0), y_targets.size(0))
-                    total_online_output = total_online_output[:min_batch_size]
-                    y_targets = y_targets[:min_batch_size]
-
-                online_loss = self.loss(total_online_output, y_targets)
-
-                # 同样的检查和修正
-                if total_offline_output.size(0) != y_targets.size(0):
-                    min_batch_size = min(total_offline_output.size(0), y_targets.size(0))
-                    total_offline_output = total_offline_output[:min_batch_size]
-                    # y_targets已经在上面处理过了，这里需要重新获取
-                    y_targets_offline = y.float().view(-1)[:min_batch_size]
-                else:
-                    y_targets_offline = y_targets
-                offline_loss = self.offline_loss(total_offline_output, y_targets_offline)
-
-
-                # 根据loss动态分配online和offline输出的权重占比
-                ##################################################################################################################################################################
-                # # 这里的online_weight、offline_weight是用于监测在测试集上的表现，self.online_weight等带self的则是在训练集上的表现
-                # online_weight, offline_weight = self.compute_dynamic_weights(online_loss, offline_loss)
-                # total_output = online_weight * online_output.detach() + offline_weight * offline_output.detach()
-                # if self.id == 1:
-                #     print("Client", self.id,
-                #           " Test metrics - Online_loss:", online_loss.item(),
-                #           " Offline_loss:", offline_loss.item(),
-                #           " Online_weight:", online_weight.item(),
-                #           " Offline_weight:", offline_weight.item())
-                ##################################################################################################################################################################
-
-                # 后续考虑根据层级递增逐渐增加offline输出占比，降低online输出占比
-                ##################################################################################################################################################################
-                # total_output = (total_online_output + total_offline_output) / 2
-                # total_loss = self.loss(total_output,y)
-                total_output = (total_online_output + total_offline_output) / 2
-                total_loss = self.loss(total_output, y.float())
-
-
-                online_losses += online_loss.item() * y.shape[0]
-                offline_losses += offline_loss.item() * y.shape[0]
-                total_losses += total_loss.item() * y.shape[0]
-
-                train_num += y.shape[0]
-
-        # self.model.cpu()
-        # self.save_model(self.model, 'model')
-
-        return online_losses, offline_losses, total_losses, train_num
 
     def compute_dynamic_weights(self, online_loss, offline_loss):
 
@@ -883,16 +582,32 @@ class clientMyMethod(clientAVG):
     def train_layer_specific(self, layer_idx, round_idx, num_clients, alpha):
         """单向teacher-student架构的层级训练"""
         trainloader = self.load_train_data()
-        self.model.train()
-        self.teacher_model.eval()
+        # self.model.train()
+        # self.teacher_model.eval()
+        #
+        # self.teacher_model.to(self.device)
+        # self.model.to(self.device)
 
-        self.teacher_model.to(self.device)
+        # 确保正在训练正确的层级
+        if layer_idx not in self.online_structure:
+            print(f"警告: 客户端 {self.id} 在 {layer_idx} 层找不到模型")
+            return
+
+        # 获取当前层的学生和教师模型模块
+        student_model_layer = self.online_structure[layer_idx]
+        teacher_model_layer = self.offline_structure[layer_idx]
+
+        student_model_layer.train()
+        teacher_model_layer.eval()
+
+        student_model_layer.to(self.device)
+        teacher_model_layer.to(self.device)
 
         # === 设置自适应学习率 ===
-        adaptive_lr = self.get_adaptive_lr()
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = adaptive_lr
-        print(f"客户端 {self.id}: 自适应学习率 {adaptive_lr:.6f}")
+        optimizer = torch.optim.Adam(student_model_layer.parameters(), lr=self.get_adaptive_lr())
+
+        trainloader = self.load_train_data()
+        epoch_losses = []
 
         epoch_losses = []
 
@@ -907,13 +622,23 @@ class clientMyMethod(clientAVG):
                 x, y = x.to(self.device), y.to(self.device).float()
                 if y.dim() > 1:
                     y = y.squeeze()
+                if x.ndim > 2:
+                    x = x.view(x.size(0), -1)
+
+                with torch.no_grad():
+                    # 教师模型前向传播
+                    teacher_features = self.offline_structure[0](x)
+                    teacher_output = self.offline_structure[1](teacher_features)
 
                 # 学生模型前向传播
-                student_output = self.model(x)
-
-                # 教师模型前向传播（无梯度）
-                with torch.no_grad():
-                    teacher_output = self.teacher_model(x)
+                # 如果训练的是分类器，需要先用特征提取器获取特征
+                if layer_idx == 1:
+                    with torch.no_grad():
+                        student_features = self.online_structure[0](x)
+                    student_output = student_model_layer(student_features)
+                # 如果训练的是特征提取器，直接前向传播
+                else:
+                    student_output = student_model_layer(x)
 
                 if student_output.dim() > 1:
                     student_output = student_output.squeeze()
@@ -923,13 +648,11 @@ class clientMyMethod(clientAVG):
                 # 计算知识蒸馏损失
                 loss = self.compute_kd_loss(student_output, teacher_output, y, alpha)
 
-                self.optimizer.zero_grad()
+                optimizer.zero_grad()
                 loss.backward()
-
                 # 梯度裁剪防止爆炸
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                self.optimizer.step()
+                optimizer.step()
                 batch_losses.append(loss.item())
 
             epoch_loss = sum(batch_losses) / len(batch_losses)

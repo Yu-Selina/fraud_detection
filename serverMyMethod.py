@@ -1,5 +1,6 @@
 import copy
 import math
+import os
 import time
 import random
 import torch
@@ -9,14 +10,27 @@ from system.flcore.clients.clientavg import clientAVG
 from system.flcore.servers.serverbase import Server
 from system.flcore.servers.serveravg import FedAvg
 from system.flcore.clients.clientMyMethod import clientMyMethod
-from sklearn.metrics import accuracy_score, recall_score, f1_score, precision_recall_curve, auc,  roc_auc_score
+from sklearn.metrics import accuracy_score, recall_score, f1_score, precision_recall_curve, auc,  roc_auc_score, average_precision_score, confusion_matrix
 import torch.nn.functional as F
 from config_privacy import *
+from torch.utils.data import TensorDataset, DataLoader
+
 
 
 class MyMethod(FedAvg):
     def __init__(self, args, times):
         super().__init__(args, times)
+
+        global_test_path = os.path.join(args.data_dir, "global_test_set.npz")
+        if os.path.exists(global_test_path):
+            data = np.load(global_test_path, allow_pickle=True)
+            x = torch.tensor(data['x']).float()
+            y = torch.tensor(data['y']).float()
+            self.global_test_data = TensorDataset(x, y)
+            print(f"成功加载全局测试集，样本数量: {len(self.global_test_data)}")
+        else:
+            self.global_test_data = None
+            print("警告: 未找到全局测试集文件。请先运行 generate_fraud_detection.py。")
 
         self.classifier_list = {}
         self.rs_online_test_acc = []
@@ -71,6 +85,8 @@ class MyMethod(FedAvg):
         self.patience = 10  # 更短的耐心，因为欺诈检测收敛慢
 
         self.global_loss = 1.0  # 用于跟踪全局损失
+
+        self.initial_global_model = copy.deepcopy(self.global_model)
 
     # 修改主训练函数
     def train(self):
@@ -137,18 +153,11 @@ class MyMethod(FedAvg):
 
             # 选择活跃客户端
             self.selected_clients = self.select_active_clients()
-            self.send_models_with_classifier()
+            self.send_models_with_classifier(layer)
 
             noisy_client_ratios = self.get_noisy_pos_ratios(self.selected_clients)# 在每轮循环内部，为本轮被选中的客户端计算自适应 alpha
             adaptive_alphas = self.compute_adaptive_alpha(noisy_client_ratios)
 
-            if round_idx % self.eval_gap == 0:
-                print(f"\n--------- 第 {layer} 层，轮次 {round_idx} ---------")
-                for cluster_idx, cluster_client_ids in enumerate(clusters):
-                    cluster_clients = [client for client in self.selected_clients if client.id in cluster_client_ids]
-                    self.train_cluster_clients(cluster_clients, layer, round_idx, adaptive_alphas)
-                self.current_round = round_idx # 为了区分不同层的轮次
-                self.evaluate()
             #梯度冲突检测
             if round_idx > 0:
                 conflict_detected = self.detect_fraud_gradient_conflicts(layer)
@@ -159,13 +168,16 @@ class MyMethod(FedAvg):
             # 客户端训练
             for client in self.selected_clients:
                 client.train_layer_specific(layer, round_idx, self.num_clients, adaptive_alphas[client.id])
+            self.receive_models_with_classifier()
             print(f"第 {layer} 层轮次 {round_idx} 完成客户端训练")
             # 检查上传的模型是否有异常
             if hasattr(self, 'fraud_aware_aggregation_enabled') and self.fraud_aware_aggregation_enabled:
                 self.fraud_aware_layer_aggregation(layer)
             else:
                 self.aggregate_parameters_by_layer(layer)
-
+            if round_idx % self.eval_gap == 0:
+                self.current_round = round_idx
+                self.evaluate()
             #理论驱动的收敛监控
             metrics = {
                 'f1': self.rs_test_f1[-1] if self.rs_test_f1 else 0.0,
@@ -563,16 +575,18 @@ class MyMethod(FedAvg):
 
 
 
-    def send_models_with_classifier(self):
-        assert (len(self.clients) > 0)  # 用assrt来确保客户端列表的客户端至少有一个，如果len(self.clients) > 0不成立那么程序就会终止运行并报错
-
+    def send_models_with_classifier(self, layer):
+        assert (len(self.clients) > 0)
         for client in self.clients:
-            start_time = time.time()  # 设置开始时间，用于后面用结束时间减去开始时间来计算发送，接受模型用时
-
-            client.set_parameters_with_classifier(self.global_model,self.classifier_list,self.structure)  # 将全局模型的参数发送给客户端
-
-            client.send_time_cost['num_rounds'] += 1  # 表示发送模型的伦次数+1
-            client.send_time_cost['total_cost'] += 2 * (time.time() - start_time)  # 计算客户端发送并接受模型参数用时
+            start_time = time.time()
+            # 只发送当前层的聚合结构
+            client.set_parameters_with_classifier(
+                self.structure,  # 只发送结构信息
+                self.classifier_list,
+                layer  # 传递当前层级
+            )
+            client.send_time_cost['num_rounds'] += 1
+            client.send_time_cost['total_cost'] += 2 * (time.time() - start_time)
 
 
 
@@ -597,8 +611,11 @@ class MyMethod(FedAvg):
                 tot_samples += client.train_samples
                 self.uploaded_ids.append(client.id)
                 self.uploaded_weights.append(client.train_samples)
-                self.uploaded_models.append(client.model)
+                self.uploaded_models.append(copy.deepcopy(client.model))
                 self.classifier_list[client.id] = copy.deepcopy(client.offline_model.classifier)
+                received_model = self.uploaded_models[-1]
+
+
         for i, w in enumerate(self.uploaded_weights):
             self.uploaded_weights[i] = w / tot_samples
 
@@ -694,161 +711,60 @@ class MyMethod(FedAvg):
                     self.global_model.state_dict()[key].data.copy_(param)
 
     def evaluate(self,acc=None, loss=None):
-        stats = self.test_metrics()
-        stats_train = self.train_metrics()
-        ids, num_samples, online_correct, offline_correct, total_correct, tot_auc, all_y_true, all_y_prob = stats
-        online_test_acc = sum(online_correct) / sum(num_samples)
-        offline_test_acc = sum(offline_correct) / sum(num_samples)
-        total_test_acc = sum(total_correct) / sum(num_samples)
+        """
+                在服务器端使用全局测试集评估全局模型。
+                """
+        if self.global_test_data is None:
+            print("无法进行全局评估：全局测试集未加载。")
+            return {}
+
+        self.global_model.eval()
+        self.global_model.to(self.device)
+        all_preds_prob = []
+        all_labels = []
+
+        test_loader = DataLoader(
+            self.global_test_data,
+            batch_size=self.args.batch_size,
+            shuffle=False
+        )
+
+        with torch.no_grad():
+            for x, y in test_loader:
+                x, y = x.to(self.device), y.to(self.device)
+
+                outputs = self.global_model(x)
+
+                # 存储预测概率和真实标签
+                all_preds_prob.extend(outputs.detach().cpu().numpy())
+                all_labels.extend(y.detach().cpu().numpy())
+
+        all_preds_prob = np.array(all_preds_prob)
+        all_labels = np.array(all_labels)
+
+        # 计算评估指标
+        binary_preds = (all_preds_prob > 0.5).astype(int)
+
+        accuracy = np.mean(binary_preds == all_labels)
+        f1 = f1_score(all_labels, binary_preds)
+        auc = roc_auc_score(all_labels, all_preds_prob)
+        auprc = average_precision_score(all_labels, all_preds_prob)
+        cm = confusion_matrix(all_labels, binary_preds)
 
 
-        # test_auc = sum(tot_auc) / sum(num_samples)
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"F1-Score: {f1:.4f}")
+        print(f"AUC: {auc:.4f}")
+        print(f"AUPRC: {auprc:.4f}")
+        print("Confusion Matrix:\n", cm)
+        print("-------------------------------------------\n")
 
-        online_train_loss = sum(stats_train[2]) / sum(stats_train[1])
-        offline_train_loss = sum(stats_train[3]) / sum(stats_train[1])
-        total_train_loss = sum(stats_train[4]) / sum(stats_train[1])
-
-        y_true_all = np.concatenate(all_y_true, axis=0)
-        y_prob_all = np.concatenate(all_y_prob, axis=0)
-        # 统一标签为 1D
-        if y_true_all.ndim == 2:
-            y_true_idx = np.argmax(y_true_all, axis=1)
-        else:
-            y_true_idx = y_true_all.reshape(-1)
-
-        # 统一分数为 1D 正类分数，并得到预测标签
-        if y_prob_all.ndim == 2 and y_prob_all.shape[1] == 2:
-            y_score = y_prob_all[:, 1].reshape(-1)  # 正类概率列
-            y_pred_all = np.argmax(y_prob_all, axis=1)  # 多列时仍可 argmax
-        else:
-            y_score = y_prob_all.reshape(-1)  # 已是 1D 正类分数
-            y_pred_all = (y_score >= 0.5).astype(int)  # 用阈值生成预测
-
-        # —— EDIT —— 全局 ROC-AUC：在拼接后的 y_true_idx / y_score 上计算，避免客户端 NaN 传染
-        if np.unique(y_true_idx).size < 2:
-            test_auc = float('nan')
-        else:
-            test_auc = auc_score = auc(*__import__('sklearn.metrics').metrics.roc_curve(y_true_idx, y_score)[
-                                        :2])  # 也可直接 roc_auc_score(y_true_idx, y_score)
-
-        acc_score = accuracy_score(y_true_idx, y_pred_all)
-        recall = recall_score(y_true_idx, y_pred_all,
-                              average="binary" if np.unique(y_true_idx).size == 2 else "macro")
-        f1 = f1_score(y_true_idx, y_pred_all,
-                      average="binary" if np.unique(y_true_idx).size == 2 else "macro")
-
-        precision, recall_curve, _ = precision_recall_curve(y_true_idx, y_score)
-        auprc = auc(recall_curve, precision)
-
-        # total_accs = [a / n for a, n in zip(stats[4], stats[1])]
-        # aucs = [a / n for a, n in zip(stats[3], stats[1])]
-
-        if acc == None:
-            self.rs_online_test_acc.append(online_test_acc)
-            self.rs_offline_test_acc.append(offline_test_acc)
-            self.rs_total_test_acc.append(total_test_acc)
-            self.rs_test_auc.append(test_auc)
-            self.rs_test_recall.append(recall)
-            self.rs_test_f1.append(f1)
-            self.rs_test_auprc.append(auprc)
-            self.eval_rounds.append(self.current_round)
-        else:
-            acc.append(online_test_acc)
-
-        if loss == None:
-            self.rs_online_train_loss.append(online_train_loss)
-            self.rs_offline_train_loss.append(offline_train_loss)
-            self.rs_total_train_loss.append(total_train_loss)
-        else:
-            loss.append(online_train_loss)
-
-        self.whether_early_stop(f1)
-
-        print("===== Global Evaluation =====")
-        # print(f"Averaged Online Train Loss : {online_train_loss:.4f}")
-        # print(f"Averaged Offline Train Loss: {offline_train_loss:.4f}")
-        # print(f"Averaged Total Train Loss  : {total_train_loss:.4f}")
-        # print(f"Averaged Online Test Acc   : {online_test_acc:.4f}")
-        # print(f"Averaged Offline Test Acc  : {offline_test_acc:.4f}")
-        # print(f"Averaged Total Test Acc    : {total_test_acc:.4f}")
-        # print(f"Averaged Test ROC-AUC      : {test_auc:.4f}")
-        # print(f"Accuracy (global)          : {acc_score:.4f}")
-        # print(f"Recall   (global)          : {recall:.4f}")
-        # print(f"F1-score (global)          : {f1:.4f}")
-        # print(f"AUPRC    (global)          : {auprc:.4f}")
-        # 简化的评估输出
-        # round_display = getattr(self, 'current_round', 0)
-        print(f"Round {self.current_round}: Acc={acc_score:.3f} Recall={recall:.3f} F1={f1:.4f} AUC={test_auc:.3f}  Losses: Online={online_train_loss:.3f} Offline={offline_train_loss:.3f}")
-
-        # 检测异常情况，决定是否打印详细信息
-        show_details = False
-        if hasattr(self, 'prev_f1'):
-            if abs(f1 - self.prev_f1) > 0.01:  # F1显著变化
-                show_details = True
-        else:
-            show_details = True  # 第一轮显示详细信息
-
-        # 检测其他异常
-        if online_train_loss > 2.0 or offline_train_loss > 2.0 or offline_train_loss < 0.2 and offline_test_acc < 0.3:
-            show_details = True
-
-        if show_details:
-            print(f"  Details: OnlineAcc={online_test_acc:.3f} OfflineAcc={offline_test_acc:.3f} AUPRC={auprc:.3f}")
-            print(f"  Losses: Online={online_train_loss:.3f} Offline={offline_train_loss:.3f}")
-
-        self.prev_f1 = f1  # 保存上一轮的F1用于比较
-
-
-    def test_metrics(self):
-        if self.eval_new_clients and self.num_new_clients > 0:  # 检查还有没有新的客户端需要评估
-            self.fine_tuning_new_clients()
-            return self.test_metrics_new_clients()
-
-        num_samples = []
-        online_correct = []
-        offline_correct = []
-        total_correct = []
-        tot_auc = []  # 本批次总的auc分数
-        all_y_true = []   #所有客户端的真实标签
-        all_y_prob = []   #所有客户端的预测概率
-        for c in self.clients:  # 对于每一个客户端执行下面操作：
-            online_test_correct_num, offline_test_correct_num, total_test_correct_num, test_num, auc, y_true, y_prob = c.test_metrics()  # 得到本次预测正确的数量，样本数量，auc值
-            online_correct.append(online_test_correct_num * 1.0)  # 将本次预测正确的数量转换成浮点数插入正确数量统计列表
-            offline_correct.append(offline_test_correct_num * 1.0)
-            total_correct.append(total_test_correct_num * 1.0)
-
-            tot_auc.append(auc * test_num)  # 总auc分数，即之后可以通过每个客户端的样本数量来决定这个客户端对全局的贡献
-            num_samples.append(test_num)  # 将本次测试的样本数加入样本总数统计列表
-
-            all_y_true.append(y_true)  # 累加真实标签
-            all_y_prob.append(y_prob)  # 累加预测概率
-        ids = [c.id for c in self.clients]
-
-        return ids, num_samples, online_correct, offline_correct, total_correct, tot_auc, all_y_true, all_y_prob
-
-    def train_metrics(self):
-        if self.eval_new_clients and self.num_new_clients > 0:
-            return [0], [1], [0]
-
-        num_samples = []
-        online_losses_list = []
-        offline_losses_list = []
-        total_losses_list = []
-        global_total_loss = 0
-        for c in self.clients:
-            online_losses, offline_losses, total_losses, train_num = c.train_metrics()  # 计算本批次总损失和训练的客户端数量
-            num_samples.append(train_num)
-            online_losses_list.append(online_losses * 1.0)
-            offline_losses_list.append(offline_losses * 1.0)
-            total_losses_list.append(total_losses * 1.0)
-
-            global_total_loss = global_total_loss + total_losses
-
-        self.global_loss = global_total_loss
-
-        ids = [c.id for c in self.clients]
-
-        return ids, num_samples, online_losses_list, offline_losses_list, total_losses_list
+        return {
+            'accuracy': accuracy,
+            'f1_score': f1,
+            'auc': auc,
+            'auprc': auprc
+        }
 
 
 
@@ -1103,14 +1019,7 @@ class MyMethod(FedAvg):
         vec = np.concatenate([one_hot, np.array([loss_feat])])
         return vec
 
-    def get_client_sample_count(self, client_id):
-        """获取客户端总样本数量"""
-        total_counts = {
-            0: 97727, 1: 10899, 2: 758, 3: 111428, 4: 1349, 5: 2483, 6: 12373, 7: 2447,
-            8: 54438, 9: 6994, 10: 516, 11: 36290, 12: 78195, 13: 11327, 14: 2489, 15: 45714,
-            16: 79961, 17: 21658, 18: 1340, 19: 12154
-        }
-        return total_counts.get(client_id, 1)
+
 
     def compute_vector_similarity(self, vec1, vec2):
         """计算两个客户端向量的相似度"""
@@ -1128,13 +1037,32 @@ class MyMethod(FedAvg):
         if not hasattr(self, 'uploaded_models') or len(self.uploaded_models) == 0:
             return
 
-        # 计算欺诈感知权重
-        aggregation_weights = self.compute_fraud_aware_weights()
+        # 为每个上传模型的客户端计算欺诈感知权重
+        ordered_uploaded_models = []
+        aggregation_weights = []
+        for client_id in self.uploaded_ids:
+            client = self.clients[client_id]
+            weight = self.compute_fraud_aware_weights(client)
+            aggregation_weights.append(weight)
+
+            # 使用索引来保证顺序
+            model_index = self.uploaded_ids.index(client_id)
+            ordered_uploaded_models.append(self.uploaded_models[model_index])
+
+        total_weight = sum(aggregation_weights)
+        if total_weight > 0:
+            aggregation_weights = [w / total_weight for w in aggregation_weights]
 
         # 执行加权聚合
-        self.weighted_parameter_aggregation(aggregation_weights)
+        # self.weighted_parameter_aggregation(ordered_uploaded_models, aggregation_weights)
+        aggregated_params = self.weighted_parameter_aggregation(ordered_uploaded_models, aggregation_weights)
+
+        # 将聚合参数应用到全局模型
+        if aggregated_params:
+            self.update_global_model(aggregated_params)
 
         print(f"第 {layer} 层使用欺诈感知聚合，权重分布: {[f'{w:.3f}' for w in aggregation_weights[:5]]}")
+
 
 
     def compute_fraud_aware_weights(self, client):
@@ -1158,14 +1086,14 @@ class MyMethod(FedAvg):
             return 1.0
 
 
-    def weighted_parameter_aggregation(self, weights, trim_ratio=0.2):
+    def weighted_parameter_aggregation(self, models, weights, trim_ratio=0.2):
         """
         Perform parameter aggregation with:
           - weight clipping & normalization (caller should pass normalized weights),
           - if evidence of suspicious clients (e.g., max(weight) too large OR detected conflict),
             do coordinate-wise trimmed mean as robust fallback.
         """
-        if len(self.uploaded_models) == 0:
+        if len(models) == 0:
             return
         # normalize defensively
         w = np.array(weights, dtype=float)
@@ -1174,44 +1102,41 @@ class MyMethod(FedAvg):
         else:
             w = w / w.sum()
 
-        # quick check: if a single client dominates or conflict mode flagged -> use trimmed mean
-        dominant = (w.max() > 0.45)  # threshold; tuneable
+        dominant = (w.max() > 0.45)
         conflict_flag = getattr(self, 'conflict_mode_active', False)
         use_trim = dominant or conflict_flag
 
-        global_dict = self.global_model.state_dict()
-        # for each parameter tensor, create stacked tensor across clients
-        for key in global_dict.keys():
+        aggregated_params = {}
+        first_model_dict = models[0].state_dict()
+        # global_dict = self.global_model.state_dict()
+        for key in first_model_dict.keys():
             if 'num_batches_tracked' in key:
                 continue
-            # collect list of tensors for this key
+
             parts = []
-            for model in self.uploaded_models:
+            for model in models:
                 sd = model.state_dict()
                 if key in sd:
                     parts.append(sd[key].detach().cpu())
             if len(parts) == 0:
                 continue
-            # stack
-            stacked = torch.stack(parts, dim=0)  # shape (m, *param_shape)
+
+            stacked = torch.stack(parts, dim=0)
+
             if use_trim and stacked.shape[0] >= 3:
                 m = stacked.shape[0]
                 k = int(max(1, math.floor(trim_ratio * m)))
-                # sort along client-dimension
                 sorted_vals, _ = torch.sort(stacked, dim=0)
                 trimmed = sorted_vals[k:m - k].mean(dim=0)
                 agg = trimmed.to(self.device)
             else:
-                # weighted average
-                # ensure weight vector matches parts length (in case some missing)
-                ws = torch.tensor(w[: stacked.shape[0]], dtype=torch.float32).view(-1, *([1] * (stacked.dim() - 1)))
+                ws = torch.tensor(w, dtype=torch.float32).view(-1, *([1] * (stacked.dim() - 1)))
                 agg = (stacked * ws).sum(dim=0).to(self.device)
-            # copy back
-            try:
-                global_dict[key].data.copy_(agg)
-            except Exception:
-                # fallback: attempt elementwise assignment
-                global_dict[key] = agg
+
+            # 核心修改：将聚合结果存入新字典
+            aggregated_params[key] = agg
+
+        return aggregated_params  # 返回聚合后的参数
 
     def fraud_detection_convergence_monitor(self, layer, round_idx, metrics, patience=3, min_delta=1e-4):
         # metrics: dict with 'f1','auc','recall'
@@ -1417,9 +1342,8 @@ class MyMethod(FedAvg):
         max_alpha = 0.8  # 设置蒸馏权重的上限
 
         for client_id, noisy_ratio in noisy_client_ratios.items():
-            # 欺诈样本比例越高，本地数据越重要，蒸馏权重 alpha 越低
-            # 使用一个简单的反向线性关系
-            alpha = 1 - noisy_ratio
+
+            alpha = noisy_ratio
 
             # 将 alpha 限制在预设范围内，以保证训练稳定性
             alphas[client_id] = max(min_alpha, min(max_alpha, alpha))
