@@ -80,14 +80,8 @@ class clientMyMethod(clientAVG):
         self.offline_learning_rate_decay = True
         self.learning_rate_decay_gamma = 0.98
 
-        self.online_structure = {
-            0: self.model.feature_extractor,
-            1: self.model.classifier
-        }
-        self.offline_structure = {
-            0: self.offline_model.feature_extractor,
-            1: self.offline_model.classifier
-        }
+        self.online_structure = {}
+        self.offline_structure = {}
 
         self.relation_kd_weight = getattr(args, 'relation_kd_weight', 0.1)
         self.relation_kd_enabled = getattr(args, 'relation_kd_enabled', True)
@@ -113,7 +107,7 @@ class clientMyMethod(clientAVG):
 
 
 
-    def train(self,global_rounds,num_clients):
+    def train(self,global_rounds,num_clients): #已经废弃！！！！！！！！！！！！！！！！！
 
         sum_local_online_loss = 0.0
         sum_local_offline_loss = 0.0
@@ -290,38 +284,174 @@ class clientMyMethod(clientAVG):
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
 
+    def train_layered(self, layer_idx, round_idx, num_clients, alpha):
+        """
+        在线模型（教师）与离线模型（学生）协同训练的函数。
+        两个模型共同优化，实现泛化知识与本地知识的融合。
+        """
 
+        # -------------------------------------------------------------------
+        # 步骤 1: 设置模型模式、设备和优化器
+        # -------------------------------------------------------------------
+        trainloader = self.load_train_data()
 
+        # 两个模型都设置为训练模式，因为它们都将被更新
+        self.model.train()  # 在线模型
+        self.offline_model.train()  # 离线模型
+        self.model.to(self.device)
+        self.offline_model.to(self.device)
 
+        # 在这个协同训练方案中，我们更新整个模型，而不是特定的层级
+        # 确保优化器是为整个模型设置的
+        # 这里我们保留你原有的双优化器设置
+
+        # -------------------------------------------------------------------
+        # 步骤 2: 训练循环和损失计算
+        # -------------------------------------------------------------------
+        epoch_losses = []
+
+        max_local_epochs = self.local_epochs
+        if self.train_slow:
+            max_local_epochs = np.random.randint(1, max_local_epochs // 2)
+
+        for epoch in range(max_local_epochs):
+            batch_losses = []
+            for step, (x, y) in enumerate(trainloader):
+                if self.train_slow:
+                    time.sleep(0.1 * np.abs(np.random.rand()))
+
+                x, y = x.to(self.device), y.to(self.device).float()
+                if y.dim() > 1:
+                    y = y.squeeze()
+                if x.ndim > 2:
+                    x = x.view(x.size(0), -1)
+
+                # 教师模型（在线模型）前向传播
+                # 这里的在线模型是教师，但它也会被更新，所以不使用 torch.no_grad()
+                teacher_output = self.model(x)
+
+                # 学生模型（离线模型）前向传播
+                student_output = self.offline_model(x)
+
+                # 统一输出维度
+                if student_output.dim() > 1:
+                    student_output = student_output.squeeze()
+                if teacher_output.dim() > 1:
+                    teacher_output = teacher_output.squeeze()
+
+                local_train_online_loss = self.loss(teacher_output, y)
+                local_train_offline_loss = self.offline_loss(student_output, y)
+
+                if round_idx != 0:
+                    # 计算知识蒸馏损失
+                    # 学生（离线）向教师（在线）学习
+                    kd_loss_offline_to_online = self.compute_kd_loss(student_output, teacher_output, y, alpha)
+
+                    # 额外增加一个反向的蒸馏损失，让在线模型也从离线模型的本地知识中学习
+                    kd_loss_online_to_offline = self.compute_kd_loss(teacher_output, student_output, y, alpha)
+
+                    # 组合总损失
+                    # 在线模型总损失 = 硬标签损失 + 反向蒸馏损失
+                    total_online_loss = local_train_online_loss + kd_loss_online_to_offline
+                    # 离线模型总损失 = 硬标签损失 + 蒸馏损失
+                    total_offline_loss = local_train_offline_loss + kd_loss_offline_to_online
+
+                # -------------------------------------------------------------------
+                # 步骤 3: 损失组合和反向传播
+                # -------------------------------------------------------------------
+                else:
+                    # 组合总损失
+                    # 在线模型总损失 = 硬标签损失 + 反向蒸馏损失
+                    total_online_loss = local_train_online_loss
+                    # 离线模型总损失 = 硬标签损失 + 蒸馏损失
+                    total_offline_loss = local_train_offline_loss
+
+                # 应用 FedProx 或其他正则化
+                mu = getattr(self, 'fedprox_mu', 0.0)
+                if mu > 0:
+                    global_snapshot = getattr(self, 'initial_params', None)
+                    offline_snapshot = getattr(self, 'initial_offline_params', None)
+                    if global_snapshot is not None:
+                        prox_online = self.apply_fedprox_proximal(self.model, global_snapshot, mu)
+                        total_online_loss += prox_online
+                    if offline_snapshot is not None:
+                        prox_offline = self.apply_fedprox_proximal(self.offline_model, offline_snapshot, mu)
+                        total_offline_loss += prox_offline
+
+                # -------------------------------------------------------------------
+                # 步骤 4: 优化两个模型
+                # -------------------------------------------------------------------
+                #考虑onlineloss和offlineloss权重？-----------------------------------------------------------------
+                total_loss = total_online_loss + total_offline_loss
+                self.optimizer.zero_grad()
+                self.offline_optimizer.zero_grad()
+                total_loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=1.0)
+                # 执行优化步骤
+                self.optimizer.step()
+                self.offline_optimizer.step()
+
+                # # 优化在线模型
+                # self.optimizer.zero_grad()
+                # total_online_loss.backward()
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # self.optimizer.step()
+                #
+                # # 优化离线模型
+                # self.offline_optimizer.zero_grad()
+                # total_offline_loss.backward()
+                # torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=1.0)
+                # self.offline_optimizer.step()
+
+                batch_losses.append(total_online_loss.item())
+
+            epoch_loss = sum(batch_losses) / len(batch_losses)
+            epoch_losses.append(epoch_loss)
+
+            # -------------------------------------------------------------------
+            # 步骤 5: 更新历史信息
+            # -------------------------------------------------------------------
+        self.online_structure[layer_idx] = copy.deepcopy(self.model).state_dict()
+        self.offline_structure[layer_idx] = copy.deepcopy(self.offline_model).state_dict()
+        # 在这个方案中，两个模型都通过优化器更新，所以不需要动量更新
+
+        # 计算平均训练损失并更新历史信息
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        self.training_loss = avg_loss
+        global_loss = getattr(self, 'received_global_loss', self.global_loss)
+        self.update_lr_history(avg_loss, global_loss, round_idx)
+
+        print(f"[CLIENT {self.id}] 协同训练完成, 平均损失: {avg_loss:.4f}")
 
 
 
     def set_parameters_with_classifier(self, global_structure, classifier_list, layer):
-        if layer in global_structure:
-            current_layer = global_structure[layer]
 
-        for group_id, group in global_structure[current_layer].items():
-            if self.id in group[0]:
-                # self.online_structure[layer] = copy.deepcopy(group[1])
-                group_state = group[1].state_dict()
-                local_state = self.model.state_dict()
-                for key, new_tensor in group_state.items():
-                    # 跳过 Online 模型的 BatchNorm 参数
-                    if any(substr in key for substr in ["bn", "running_mean", "running_var", "num_batches_tracked"]):
-                        continue
-                    # 其他参数照常更新
-                    if key in local_state and local_state[key].shape == new_tensor.shape:
-                        local_state[key].copy_(new_tensor)# 直接把新模型的值 copy_ 到旧模型对应项
-                # 【插入点 A】：包裹 online 子模型
-                temp_model = copy.deepcopy(self.model)
-                temp_model.to(self.device)
-                self.online_structure[current_layer] = LogitHeadWrapper(temp_model, self.num_classes).to(self.device)
 
-                # self.online_structure[current_layer] = copy.deepcopy(self.model)
-        # 【插入点 B】：包裹 offline 子模型
-        temp_offline_model = copy.deepcopy(self.offline_model)
-        temp_offline_model.to(self.device)  # 确保复制的模型在正确设备上
-        self.offline_structure[current_layer] = LogitHeadWrapper(temp_offline_model, self.num_classes).to(self.device)
+        local_online_state_dict = self.model.state_dict()
+
+        # 遍历服务器传来的全局参数字典
+        for key, new_tensor in global_structure.items():
+            # 检查是否为BatchNorm层的参数
+            if any(substr in key for substr in ["bn", "running_mean", "running_var", "num_batches_tracked"]):
+                # 如果是BN层参数，则跳过不更新
+                continue
+
+            # 对于所有其他参数，进行更新
+            if key in local_online_state_dict and local_online_state_dict[key].shape == new_tensor.shape:
+                local_online_state_dict[key].copy_(new_tensor)
+
+        # 将修改后的本地状态字典加载回在线模型
+        self.model.load_state_dict(local_online_state_dict)
+        self.model.to(self.device)
+
+        # self.online_structure[current_layer] = copy.deepcopy(self.model)
+
+        # temp_offline_model = copy.deepcopy(self.offline_model)
+        # temp_offline_model.to(self.device)  # 确保复制的模型在正确设备上
+        # self.offline_structure[current_layer] = temp_offline_model.state_dict()
         # self.offline_structure[current_layer] = copy.deepcopy(self.offline_model)
 
         if classifier_list != {}:
@@ -334,27 +464,10 @@ class clientMyMethod(clientAVG):
         self.initial_params = {name: param.data.clone().detach().to(self.device) for name, param in self.model.named_parameters()}
         self.initial_offline_params = {name: param.data.clone().detach().to(self.device)for name, param in self.offline_model.named_parameters()}
 
-        for key in self.online_structure.keys():
-            self.online_structure[key].to(self.device)
-        for key in self.offline_structure.keys():
-            self.offline_structure[key].to(self.device)
-                    # if classifier_list != {}:
-                    #     self.other_classifier = {}
-                    #
-                    #     for new_param, old_param in zip(model.parameters(), self.model.parameters()):
-                    #         for key in model.state_dict().keys():
-                    #             if 'bn' not in key:
-                    #                 old_param.data = new_param.data.clone()
-                    #     for id,classifier in classifier_list.items():
-                    #         # if id != self.id:
-                    #         self.other_classifier[id] = copy.deepcopy(classifier)
-                    #
-                    # else:
-                    #     for new_param, old_param in zip(model.parameters(), self.model.parameters()):
-                    #         for key in model.state_dict().keys():
-                    #             if 'bn' not in key:
-                    #                 old_param.data = new_param.data.clone()
-
+        # for key in self.online_structure.keys():
+        #     self.online_structure[key].to(self.device)
+        # for key in self.offline_structure.keys():
+        #     self.offline_structure[key].to(self.device)
 
     def compute_consistency_loss(self, online_features, offline_features):
         """添加特征一致性损失"""
@@ -550,6 +663,8 @@ class clientMyMethod(clientAVG):
 #----------------------------------------------------------------------------------------------------------------
     def update_teacher_momentum(self):
         """动量更新Teacher模型"""
+        self.teacher_model.to(self.device)
+        self.model.to(self.device)
         with torch.no_grad():
             for teacher_param, student_param in zip(
                     self.teacher_model.parameters(),
@@ -579,7 +694,7 @@ class clientMyMethod(clientAVG):
         total_loss = alpha * hard_loss + (1 - alpha) * soft_loss
         return total_loss
 
-    def train_layer_specific(self, layer_idx, round_idx, num_clients, alpha):
+    def train_layer_specific(self, layer_idx, round_idx, num_clients, alpha):#已经废弃！！！！！！！！！！！！！！！！！
         """单向teacher-student架构的层级训练"""
         trainloader = self.load_train_data()
         # self.model.train()
@@ -599,7 +714,10 @@ class clientMyMethod(clientAVG):
 
         student_model_layer.train()
         teacher_model_layer.eval()
-
+        self.model.train()
+        self.offline_model.eval()
+        self.model.to(self.device)
+        self.offline_model.to(self.device)
         student_model_layer.to(self.device)
         teacher_model_layer.to(self.device)
 
@@ -627,18 +745,19 @@ class clientMyMethod(clientAVG):
 
                 with torch.no_grad():
                     # 教师模型前向传播
-                    teacher_features = self.offline_structure[0](x)
-                    teacher_output = self.offline_structure[1](teacher_features)
+                    teacher_features = self.offline_model.produce_feature(x)
+                    teacher_output = self.offline_model.classifier(teacher_features)
 
                 # 学生模型前向传播
                 # 如果训练的是分类器，需要先用特征提取器获取特征
                 if layer_idx == 1:
                     with torch.no_grad():
-                        student_features = self.online_structure[0](x)
+                        student_features = self.model.produce_feature(x)
                     student_output = student_model_layer(student_features)
                 # 如果训练的是特征提取器，直接前向传播
                 else:
-                    student_output = student_model_layer(x)
+                    student_features = student_model_layer.produce_feature(x)
+                    student_output = self.model.classifier(student_features)
 
                 if student_output.dim() > 1:
                     student_output = student_output.squeeze()

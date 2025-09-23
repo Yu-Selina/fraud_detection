@@ -92,7 +92,7 @@ class MyMethod(FedAvg):
     def train(self):
         """多层级训练主循环"""
         # 初始化第0层
-        self.structure[0][0] = [np.arange(self.num_clients), copy.deepcopy(self.global_model)]
+        self.structure[0][0] = [np.arange(self.num_clients), copy.deepcopy(self.global_model).state_dict()]
 
         for layer in range(self.max_layers):
             print(f"\n{'=' * 50}")
@@ -117,6 +117,7 @@ class MyMethod(FedAvg):
 
     def train_current_layer(self, layer):
         """训练指定层级的联邦学习"""
+
         print(f"\n开始第 {layer} 层训练")
         print(f"活跃客户端: {[client.id for client in self.selected_clients]}")
 
@@ -125,7 +126,7 @@ class MyMethod(FedAvg):
 
         # 根据层级决定聚类策略
         if layer == 0:
-            # 第0层使用全局聚合
+            self.selected_clients = self.select_active_clients()
             clusters = [[client.id for client in self.selected_clients]]
             print(f"第 {layer} 层采用全局聚合")
         else:
@@ -136,6 +137,7 @@ class MyMethod(FedAvg):
             for i, cluster in enumerate(clusters):
                 print(f"聚类 {i}: 客户端 {cluster}")
 
+        self.initialize_cluster_models(layer, clusters)
 
         layer_rounds = self.layer_rounds[layer] if layer < len(self.layer_rounds) else 15
 
@@ -153,7 +155,7 @@ class MyMethod(FedAvg):
 
             # 选择活跃客户端
             self.selected_clients = self.select_active_clients()
-            self.send_models_with_classifier(layer)
+            self.send_models_with_classifier(layer,clusters)
 
             noisy_client_ratios = self.get_noisy_pos_ratios(self.selected_clients)# 在每轮循环内部，为本轮被选中的客户端计算自适应 alpha
             adaptive_alphas = self.compute_adaptive_alpha(noisy_client_ratios)
@@ -167,7 +169,8 @@ class MyMethod(FedAvg):
 
             # 客户端训练
             for client in self.selected_clients:
-                client.train_layer_specific(layer, round_idx, self.num_clients, adaptive_alphas[client.id])
+                client.train_layered(layer, round_idx, self.num_clients, adaptive_alphas[client.id])
+                # client.train(round_idx,self.num_clients)
             self.receive_models_with_classifier()
             print(f"第 {layer} 层轮次 {round_idx} 完成客户端训练")
             # 检查上传的模型是否有异常
@@ -209,6 +212,26 @@ class MyMethod(FedAvg):
         selected_num = min(self.current_num_join_clients, len(active_list))
         selected_indices = random.sample(active_list, selected_num)
         return [self.clients[i] for i in selected_indices]
+
+    def initialize_cluster_models(self, layer, clusters):
+        """
+        为指定层级的每个聚类初始化模型。
+        """
+        # 确保当前层级的字典存在
+        if layer not in self.structure:
+            self.structure[layer] = {}
+
+        for cluster_id, client_ids in enumerate(clusters):
+            # 仅当该聚类模型不存在时才初始化
+            if cluster_id not in self.structure[layer]:
+                # 获取聚类中第一个客户端的初始模型参数作为起点
+                first_client_id = client_ids[0]
+                initial_model_params = copy.deepcopy(self.clients[first_client_id].model).state_dict()
+
+                # 将初始化好的模型参数存入对应的聚类键下
+                self.structure[layer][cluster_id] = [client_ids, initial_model_params]
+                print(f"服务器: 第 {layer} 层，聚类 {cluster_id} 模型参数初始化完成。")
+
 
     def generate_next_layer_clusters(self, layer_idx):
         """为下一层生成聚类"""
@@ -534,11 +557,27 @@ class MyMethod(FedAvg):
 
     def freeze_current_layer_parameters(self, layer):
         """冻结当前层的参数"""
-        if layer in self.structure:
-            for cluster_id, (_, cluster_model) in self.structure[layer].items():
-                for param in cluster_model.parameters():
-                    param.requires_grad = False
-            print(f"已冻结第 {layer} 层的参数")
+        if layer not in self.structure:
+            print("freeze_current_layer_parameters:layer not in self.structure")
+            return
+
+        # 遍历当前层级的每个聚类模型
+        for cluster_id, (_, cluster_model) in self.structure[layer].items():
+            # 1. 创建一个临时的全局模型对象
+            # 这一步是必要的，因为 `requires_grad` 属性是 nn.Parameter 的，不是 state_dict 的。
+            temp_model = copy.deepcopy(self.global_model)
+
+            # 2. 将存储的参数加载到临时模型上
+            temp_model.load_state_dict(cluster_model)
+
+            # 3. 遍历临时模型的所有参数并全部冻结
+            for param in temp_model.parameters():
+                param.requires_grad = False
+
+            # 4. 将修改后的参数再保存回 self.structure
+            self.structure[layer][cluster_id][1] = temp_model.state_dict()
+
+        print(f"已冻结第 {layer} 层的参数")
 
     def update_client_performance_tracking(self):
         """更新客户端性能跟踪"""
@@ -575,13 +614,24 @@ class MyMethod(FedAvg):
 
 
 
-    def send_models_with_classifier(self, layer):
+    def send_models_with_classifier(self, layer, clusters):
         assert (len(self.clients) > 0)
+        # 构建一个客户端ID到聚类ID的映射
+        client_to_cluster_map = {}
+        for cluster_idx, cluster_clients_ids in enumerate(clusters):
+            for client_id in cluster_clients_ids:
+                client_to_cluster_map[client_id] = cluster_idx
+
         for client in self.clients:
             start_time = time.time()
-            # 只发送当前层的聚合结构
+            try:
+                cluster_idx = client_to_cluster_map[client.id]
+            except KeyError:
+                print(f"警告: 客户端 {client.id} 不在当前聚类列表中。")
+                continue
+            model_to_send = self.structure[layer][cluster_idx][1]
             client.set_parameters_with_classifier(
-                self.structure,  # 只发送结构信息
+                model_to_send,  # 只发送结构信息
                 self.classifier_list,
                 layer  # 传递当前层级
             )
