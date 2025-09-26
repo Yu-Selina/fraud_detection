@@ -63,8 +63,6 @@ class clientMyMethod(clientAVG):
         self.online_structure = {}
         self.offline_structure = {}
 
-        self.relation_kd_weight = getattr(args, 'relation_kd_weight', 0.1)
-        self.relation_kd_enabled = getattr(args, 'relation_kd_enabled', True)
 
         # 监控相关变量
         self.anomaly_count = 0
@@ -253,10 +251,10 @@ class clientMyMethod(clientAVG):
 
                 # 教师模型（在线模型）前向传播
                 # 这里的在线模型是教师，但它也会被更新，所以不使用 torch.no_grad()
-                teacher_output = self.model(x)
+                teacher_output = self.offline_model(x)
 
                 # 学生模型（离线模型）前向传播
-                student_output = self.offline_model(x)
+                student_output = self.model(x)
 
                 if torch.isnan(teacher_output).any() or torch.isinf(teacher_output).any():
                     print(f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，teacher_output 包含 NaN/Inf！")
@@ -428,7 +426,7 @@ class clientMyMethod(clientAVG):
         #         for name in self.latest_model_params:
         #             self.latest_model_params[name] += param_increment[name]
 
-        # >>> 新增 FedNova 所需的上传信息
+
         # 计算客户端模型参数相对于初始全局模型的增量
         initial_online_params = getattr(self, 'initial_params', None)
 
@@ -491,86 +489,13 @@ class clientMyMethod(clientAVG):
         self.initial_params = {name: param.data.clone().detach().to(self.device) for name, param in self.model.named_parameters()}
         self.initial_offline_params = {name: param.data.clone().detach().to(self.device)for name, param in self.offline_model.named_parameters()}
 
-        # for key in self.online_structure.keys():
-        #     self.online_structure[key].to(self.device)
-        # for key in self.offline_structure.keys():
-        #     self.offline_structure[key].to(self.device)
 
-    # def compute_consistency_loss(self, online_features, offline_features):
-    #     """添加特征一致性损失"""
-    #     return F.mse_loss(online_features, offline_features.detach())
-
-
-
-    # def compute_dynamic_weights(self, online_loss, offline_loss):
-    #
-    #     total_loss = online_loss.detach() + offline_loss.detach()
-    #     online_weight_temp = online_loss / total_loss
-    #     online_weight = 1 - online_weight_temp
-    #     offline_weight_temp = offline_loss / total_loss
-    #     offline_weight = 1 - offline_weight_temp
-    #
-    #
-    #
-    #     return online_weight, offline_weight
-    #
 
 
 
 #######################################################################################################################################################
 
 
-
-    # def compute_relation_distillation(self, online_features, offline_features):
-    #     """特征层面的关系蒸馏"""
-    #     batch_size = online_features.size(0)
-    #
-    #     # 批次太小时跳过关系蒸馏
-    #     if batch_size < 2:
-    #         return torch.tensor(0.0, device=online_features.device, requires_grad=True)
-    #
-    #     try:
-    #         # 计算特征间的欧氏距离矩阵
-    #         online_dist = torch.cdist(online_features, online_features, p=2)
-    #         offline_dist = torch.cdist(offline_features, offline_features, p=2)
-    #
-    #         # 归一化距离矩阵以提高稳定性
-    #         online_dist = online_dist / (online_dist.max() + 1e-8)
-    #         offline_dist = offline_dist / (offline_dist.max() + 1e-8)
-    #
-    #         # 关系一致性损失 - 使用detach()避免梯度循环
-    #         relation_loss = F.mse_loss(online_dist, offline_dist.detach()) + \
-    #                         F.mse_loss(offline_dist, online_dist.detach())
-    #
-    #         return relation_loss * 0.5  # 取平均
-    #
-    #     except Exception as e:
-    #         print(f"关系蒸馏计算出错: {e}")
-    #         return torch.tensor(0.0, device=online_features.device, requires_grad=True)
-
-
-
-    # def check_anomaly(self, online_loss, offline_loss, online_acc, offline_acc):
-    #     # 根据训练轮数动态调整阈值
-    #     if hasattr(self, 'round_count'):
-    #         # 早期训练：宽松阈值
-    #         if self.round_count < 10:
-    #             loss_threshold = 3.0
-    #         # 中期训练：中等阈值
-    #         elif self.round_count < 50:
-    #             loss_threshold = 2.0
-    #         # 后期训练：严格阈值
-    #         else:
-    #             loss_threshold = 1.0
-    #     else:
-    #         loss_threshold = 2.0
-    #
-    #     # 基于历史损失的相对阈值
-    #     if hasattr(self, 'loss_history') and len(self.loss_history) >= 5:
-    #         avg_loss = np.mean(self.loss_history[-5:])
-    #         std_loss = np.std(self.loss_history[-5:])
-    #         relative_threshold = avg_loss + 2 * std_loss  # 2倍标准差
-    #         loss_threshold = min(loss_threshold, relative_threshold)
 
 
     def log_gradient_norms(self):
@@ -595,19 +520,7 @@ class clientMyMethod(clientAVG):
             print(f"    [CLIENT {self.id}] ACTIVATION WARNING: Max={model_output.abs().max().item():.3f}")
 
 
-    def apply_fedprox_proximal(self, model, global_params_dict, mu):
-        """
-        Compute proximal penalty: (mu/2) * sum ||param - global_param||^2
-        global_params_dict: mapping name -> tensor (server-sent snapshot)
-        """
-        if mu is None or mu <= 0:
-            return 0.0
-        prox = 0.0
-        for name, p in model.named_parameters():
-            if name in global_params_dict:
-                g = global_params_dict[name].to(p.device)
-                prox += ((p - g).norm(2) ** 2)
-        return 0.5 * mu * prox
+
 
     def get_client_fraud_level(self):
         """
@@ -670,21 +583,51 @@ class clientMyMethod(clientAVG):
     #                     (1 - self.momentum_tau) * student_param.data
     #             )
 
-    def compute_kd_loss(self, student_logits, teacher_logits, labels, alpha):
-        """二分类计算单向知识蒸馏损失"""
-        hard_loss = F.binary_cross_entropy_with_logits(student_logits, labels)
+    def compute_kd_loss(self,teacher_logits, student_logits, labels, alpha):
+        """
+        teacher_logits, student_logits: raw logits (not sigmoid applied), shape (B,) or (B,1)
+        labels: optional ground-truth (0/1) for CE term
+        alpha: weight for CE_with_labels (student supervised)
+        beta: 1-alpha for KD (teacher->student)
+        temperature: T
+        """
+        T = self.temperature
+        # ensure shape (B,1)
+        if teacher_logits.dim() == 1:
+            teacher_logits = teacher_logits.unsqueeze(1)
+        if student_logits.dim() == 1:
+            student_logits = student_logits.unsqueeze(1)
 
-        # 软标签损失：让学生模型预测教师模型的“软化”输出
-        # 这里我们使用教师模型的软化 logits 作为目标
-        # 不需要显式地计算概率，直接使用 BCEWithLogitsLoss
-        soft_loss = F.binary_cross_entropy_with_logits(
-            student_logits / self.temperature,
-            (teacher_logits / self.temperature).sigmoid().detach()
-        )
+        # supervised loss for student (use BCEWithLogits for numerical stability)
+        ce_loss = torch.tensor(0.0, device=student_logits.device)
+        if labels is not None:
+            labels = labels.float().unsqueeze(1)
+            ce_loss = F.binary_cross_entropy_with_logits(student_logits, labels)
 
-        # 组合损失
-        total_loss = alpha * hard_loss + (1 - alpha) * soft_loss
-        return total_loss
+        # KD loss: KL between teacher_soft and student_soft
+        # For binary case, use softmax on two logits [logit, 0] or apply sigmoid then transform?
+        # Simpler robust approach: treat logits as 2-class logits: [logit, 0]
+
+
+        t2 = self.to_2class_logits(teacher_logits) / T
+        s2 = self.to_2class_logits(student_logits) / T
+
+        # compute soft targets and student log-probs
+        p_teacher = F.softmax(t2, dim=1)
+        log_p_student = F.log_softmax(s2, dim=1)
+
+        # KLDiv expects input = log-probs, target = probs
+        kd_loss = F.kl_div(log_p_student, p_teacher, reduction='batchmean') * (T * T)
+
+        alpha_val = alpha
+        beta_val = 1.0 - alpha_val
+
+        total = alpha_val * ce_loss + beta_val * kd_loss
+        return total, ce_loss.detach() if labels is not None else None, kd_loss.detach()
+
+    def to_2class_logits(self,x):
+        return torch.cat([x, torch.zeros_like(x)], dim=1)  # shape (B,2)
+
 
     # def train_layer_specific(self, layer_idx, round_idx, num_clients, alpha):#已经废弃！！！！！！！！！！！！！！！！！
     #     """单向teacher-student架构的层级训练"""

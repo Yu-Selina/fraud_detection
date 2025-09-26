@@ -185,7 +185,7 @@ class MyMethod(FedAvg):
                 # 训练聚类内的客户端
                 for client in cluster_clients:
                     # 调用客户端的训练函数
-                    # if client.id == 0:
+                    # if client.id == 0 or client.id == 1:
                         client.train_layered(layer, round_idx, self.num_clients, adaptive_alphas[client.id])
                         # print("len（client.train_samples）的值为：",len(client.train_samples))
                         # print("len（client.train_samples）的类型为：",type(len(client.train_samples)))
@@ -600,57 +600,67 @@ class MyMethod(FedAvg):
             # 步骤1: 评估每个客户端模型，并计算其AUPRC加权
             auprcs = {}
             client_updates = []
-            total_auprc_sum = 0
+            total_weight_sum = 0
 
             # 获取当前聚类的全局模型参数，结构为 self.structure[layer][cluster_idx][1]
             current_cluster_params = self.structure[layer][cluster_id][1]
-
             uploaded_cluster_ids = self.uploaded_ids[cluster_id]
 
-            # 使用 zip 函数将模型和其对应的ID配对
+            # 用于平滑的全局先验（例如全局验证集的AUPRC）
+            global_ap_prior = 0.1
+            k = 50  # 平滑强度
+            lam = 0.5  # 样本数融合比例
+
+
+
             for client_id, client_model in zip(uploaded_cluster_ids, uploaded_cluster_models):
-                # 获取模型的参数（state_dict）
                 model_params = client_model.state_dict()
-
-                # 调用 evaluate_client_model_before_aggregate 方法
+                print(f"正在评估客户端 {client_id} 模型...")
                 metrics = self.evaluate_client_model_before_aggregate(model_params, cluster_id, layer)
+                if metrics is None:
+                    print(f"警告: 客户端 {client_id} 的评估结果为 None，跳过该客户端。")
+                    continue  # 跳过该客户端
 
-                # 使用AUPRC作为权重，它能平衡精确率和召回率
-                weight = metrics.get('AUPRC', 0.0)
+                print(f"评估结果: {metrics}")
+                raw_auprc = metrics.get('AUPRC', 0.0)
+                n_samples = metrics.get('NumSamples', 0)
+
+                # 平滑后的 AUPRC
+                ap_smooth = (raw_auprc * n_samples + global_ap_prior * k) / (n_samples + k)
+
+                # 融合样本数的权重
+                weight = lam * n_samples + (1 - lam) * ap_smooth
+
                 auprcs[client_id] = weight
-
-                total_auprc_sum += weight
+                total_weight_sum += weight
                 client_updates.append((weight, model_params))
-
-            if total_auprc_sum == 0:
-                print(f"警告: 聚类 {cluster_id} 的AUPRC总和为0，无法进行聚合。请检查客户端模型的AUPRC。")
+            if total_weight_sum == 0:
+                print(f"警告: 聚类 {cluster_id} 的权重总和为0，无法进行聚合。")
                 continue
 
-            # 初始化聚合后的模型参数
             aggregated_params = {
                 key: torch.zeros_like(value).to(self.device)
                 for key, value in current_cluster_params.items()
             }
 
-            # 步骤2: 执行加权聚合
             with torch.no_grad():
                 for weight, model_params in client_updates:
-                    normalized_weight = weight / total_auprc_sum
+                    normalized_weight = weight / total_weight_sum
                     for key in aggregated_params:
                         if key in model_params and 'bn' not in key:
                             aggregated_params[key] += normalized_weight * model_params[key].to(self.device)
                         elif 'bn' in key:
                             aggregated_params[key] += current_cluster_params[key].to(self.device)
 
-                # 步骤3: 将聚合后的参数应用到全局模型中
                 for key, param in aggregated_params.items():
                     if key in self.structure[layer][cluster_id][1]:
                         self.structure[layer][cluster_id][1][key].data.copy_(param.cpu())
 
             print(f"服务器: 第 {layer} 层，聚类 {cluster_id} 模型聚合完成，并已更新。")
             client_id_list = uploaded_cluster_ids
-            print(f"   聚合权重 (AUPRC): {[f'{auprcs.get(cid, 0):.3f}' for cid in client_id_list[:5]]}")
-            # # 为每个上传模型的客户端计算欺诈感知权重
+            print(f"   聚合权重 (平滑+样本融合): {[f'{auprcs.get(cid, 0):.3f}' for cid in client_id_list[:5]]}")
+
+        # # 为每个上传模型的客户端计算欺诈感知权重
             # aggregation_weights = []
             # for client in cluster_clients:
             #     weight = self.compute_fraud_aware_weights(client)
@@ -846,7 +856,7 @@ class MyMethod(FedAvg):
 
 #--------------------------------------------------------------------------------------------------------------------------------------------------
     def compute_gradient_similarity(self, client_updates):   #启用
-        """计算客户端之间的梯度相似度"""
+        """计算客户端之间的相似度"""
         similarities = {}
         client_ids = list(client_updates.keys())
 
@@ -984,14 +994,13 @@ class MyMethod(FedAvg):
         """
         使用服务器的本地验证集对客户端模型进行评估。
         """
+        print("开始加载模型参数...")
         temp_model = copy.deepcopy(self.global_model)
-
-        # 加载客户端的参数
         temp_model.load_state_dict(model_params)
+        print("模型参数加载成功")
         temp_model.to(self.device)
         temp_model.eval()
 
-        # 获取该聚类的验证数据加载器
         test_loader = DataLoader(
             self.global_test_data,
             batch_size=self.batch_size,
@@ -1005,19 +1014,17 @@ class MyMethod(FedAvg):
             for i, (inputs, labels) in enumerate(test_loader):
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 outputs = temp_model(inputs)
-
                 probs = torch.sigmoid(outputs)
 
                 y_true.extend(labels.cpu().numpy())
                 y_pred_probs.extend(probs.cpu().numpy())
 
-        # 计算评估指标
         y_pred = (np.array(y_pred_probs) > 0.5).astype(int)
         metrics = {}
         metrics['Accuracy'] = accuracy_score(y_true, y_pred)
         metrics['F1-Score'] = f1_score(y_true, y_pred, zero_division=0)
         metrics['Recall'] = recall_score(y_true, y_pred, zero_division=0)
-        # 核心：计算AUPRC，它将作为聚合权重
         metrics['AUPRC'] = average_precision_score(y_true, y_pred_probs)
+        metrics['NumSamples'] = len(y_true)  # 新增：样本数，用于权重融合
 
         return metrics
