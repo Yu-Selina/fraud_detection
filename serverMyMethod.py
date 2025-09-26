@@ -616,7 +616,7 @@ class MyMethod(FedAvg):
             for client_id, client_model in zip(uploaded_cluster_ids, uploaded_cluster_models):
                 model_params = client_model.state_dict()
                 print(f"正在评估客户端 {client_id} 模型...")
-                metrics = self.evaluate_client_model_before_aggregate(model_params, cluster_id, layer)
+                metrics = self.evaluate_client_model_before_aggregate(model_params, cluster_id, layer, client_id)
                 if metrics is None:
                     print(f"警告: 客户端 {client_id} 的评估结果为 None，跳过该客户端。")
                     continue  # 跳过该客户端
@@ -990,7 +990,7 @@ class MyMethod(FedAvg):
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------
 
-    def evaluate_client_model_before_aggregate(self, model_params, cluster_id, layer):
+    def evaluate_client_model_before_aggregate(self, model_params, cluster_id, layer,client_id):
         """
         使用服务器的本地验证集对客户端模型进行评估。
         """
@@ -1025,6 +1025,36 @@ class MyMethod(FedAvg):
         metrics['F1-Score'] = f1_score(y_true, y_pred, zero_division=0)
         metrics['Recall'] = recall_score(y_true, y_pred, zero_division=0)
         metrics['AUPRC'] = average_precision_score(y_true, y_pred_probs)
-        metrics['NumSamples'] = len(y_true)  # 新增：样本数，用于权重融合
+        num_samples = None
+        try:
+            # 先定位 client_id 在该 cluster 中的 index
+            idx = self.uploaded_ids[cluster_id].index(client_id)
+        except Exception:
+            idx = None
+            print("evaluate_client_model_before_aggregate:try except wrong!")
 
+        if idx is not None:
+            try:
+                num_samples = self.uploaded_weights[cluster_id][idx]
+            except Exception:
+                num_samples = None
+                print("evaluate_client_model_before_aggregate:try except wrong!")
+            # 如果 uploaded_weights 不可用，再尝试从 uploaded_models 中读取（如果那一项是 dict 且包含 'num_samples'）
+        if num_samples is None and idx is not None:
+            try:
+                uploaded_entry = self.uploaded_models[cluster_id][idx]
+                if isinstance(uploaded_entry, dict):
+                    num_samples = uploaded_entry.get('num_samples', None)
+            except Exception:
+                num_samples = None
+                print("evaluate_client_model_before_aggregate:try except wrong!")
+            # 最后回退到全局验证集的样本数（兼容旧逻辑）
+        if num_samples is None:
+            num_samples = len(y_true)
+
+        try:
+            metrics['NumSamples'] = int(num_samples)
+        except Exception:
+            metrics['NumSamples'] = len(y_true)
+            print("evaluate_client_model_before_aggregate:try except wrong!")
         return metrics

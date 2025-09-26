@@ -284,20 +284,20 @@ class clientMyMethod(clientAVG):
                 if round_idx != 0:
                     # 计算知识蒸馏损失
                     # # 学生（离线）向教师（在线）学习
-                    # kd_loss_offline_to_online = self.compute_kd_loss(student_output, teacher_output, y, alpha)
+                    # kd_loss_online_to_offlinee = self.compute_kd_loss(student_output, teacher_output, y, alpha)
 
                     # 额外增加一个反向的蒸馏损失，让在线模型也从离线模型的本地知识中学习
-                    kd_loss_online_to_offline = self.compute_kd_loss(teacher_output, student_output, y, alpha)
+                    kd_loss_offline_to_online, ce_val, kd_val = self.compute_kd_loss(teacher_output, student_output, y, alpha)
 
                     # 组合总损失
                     # 在线模型总损失 = 硬标签损失 + 反向蒸馏损失
-                    total_online_loss = local_train_online_loss + kd_loss_online_to_offline
+                    total_online_loss = local_train_online_loss + kd_loss_offline_to_online
                     # 离线模型总损失 = 硬标签损失 + 蒸馏损失
                     # total_offline_loss = local_train_offline_loss + kd_loss_offline_to_online
                     total_offline_loss = local_train_offline_loss
 
                     if step == len(trainloader) - 1 and epoch == max_local_epochs - 1:
-                        print(f"客户端 {self.id} 的蒸馏损失 kd_loss: {kd_loss_online_to_offline.item():.4f}")
+                        print(f"客户端 {self.id} 的蒸馏损失 kd_loss: { kd_loss_offline_to_online.item():.4f}")
 
                 # -------------------------------------------------------------------
                 # 步骤 3: 损失组合和反向传播
