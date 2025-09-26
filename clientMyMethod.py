@@ -1,5 +1,7 @@
 
 import copy
+import os
+
 import torch
 import numpy as np
 import time
@@ -12,36 +14,14 @@ from system.utils.privacy import *
 from system.flcore.clients.clientavg import clientAVG
 from system.utils.data_utils import get_class_counts
 from system.utils.data_utils import LogitHeadWrapper
+from imblearn.over_sampling import SMOTE
+from collections import Counter
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from sklearn.metrics import f1_score
 
 class clientMyMethod(clientAVG):
     def __init__(self, args, id, train_samples, test_samples, **kwargs):
         super().__init__(args, id, train_samples, test_samples, **kwargs)
-
-
-
-        # 离线模型：加权BCE，给正样本更高权重
-        def get_weighted_bce():
-            def weighted_bce_loss(inputs, targets):
-                pos_count = (targets == 1).sum()
-                neg_count = (targets == 0).sum()
-
-                if pos_count > 0:
-                    pos_weight = neg_count.float() / pos_count.float()
-                    # pos_weight = torch.clamp(pos_weight, min=1.0, max=10.0)  # 限制权重范围
-                    pos_weight = torch.clamp(pos_weight, min=1.0,max=50.0)  # 不限制权重范围
-                else:
-                    pos_weight = torch.tensor(1.0)
-
-                return F.binary_cross_entropy_with_logits(
-                    inputs, targets,
-                    pos_weight=pos_weight,
-                    reduction='mean'
-                )
-
-            return weighted_bce_loss
-
-        self.loss = get_weighted_bce()
-        self.offline_loss = get_weighted_bce()
 
         # 单向Teacher-Student参数
         self.momentum_tau = getattr(args, 'momentum_tau', 0.99)  # 动量系数
@@ -101,188 +81,12 @@ class clientMyMethod(clientAVG):
         self.current_round = 0
         self.last_loss = 1.0
         self.global_loss = 1.0
+        self.latest_model_params = {}
+
+        self.public_val_loader = self.load_public_validation_set()
+        self.local_f1_score = 0
 
 
-
-
-
-
-    def train(self,global_rounds,num_clients): #已经废弃！！！！！！！！！！！！！！！！！
-
-        sum_local_online_loss = 0.0
-        sum_local_offline_loss = 0.0
-        sum_classifier_online_loss = 0.0
-        sum_classifier_offline_loss = 0.0
-        sum_total_online_loss = 0.0
-        sum_total_offline_loss = 0.0
-        num_batches = 0
-
-        # 添加L2正则化
-        l2_lambda = 1e-4  # L2正则化系数
-
-        # KL散度损失函数，用于度量两个分布的差异
-        kl_loss = nn.KLDivLoss(reduction='batchmean')
-
-        trainloader = self.load_train_data()  # 加载训练数据
-        self.model.to(self.device)
-        self.offline_model.to(self.device)
-        self.model.train()  #在线模型
-        self.offline_model.train()  #离线模型
-        if not self.local_analysis_done:
-            self.analyze_data_locally(trainloader)
-            self.local_analysis_done = True
-
-        start_time = time.time()
-
-        max_local_epochs = self.local_epochs
-        if self.train_slow:
-            max_local_epochs = np.random.randint(1, max_local_epochs // 2)
-
-        total_gradient_norm = 0.0  # 总梯度范数
-        total_batches = 0  # 总批次数
-
-
-        for epoch in range(max_local_epochs):   #本地训练阶段
-            for i, (x, y) in enumerate(
-                    trainloader):  # 也可以是for  x,y in trainloader： 区别只是原文中的可以获取每个训练批次的数据和索引，而注释里这个简化版只能直接获取每个批次的数据而不能取得对应的索引
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)
-                else:
-                    x = x.to(self.device)
-                y = y.to(self.device)
-                if self.train_slow:
-                    time.sleep(0.1 * np.abs(np.random.rand()))
-
-                online_feature = self.model.produce_feature(x)   #提取特征并给出输出
-                online_output = self.model.classifier(online_feature).squeeze(1)
-                offline_feature = self.offline_model.produce_feature(x)
-                offline_output = self.offline_model.classifier(offline_feature).squeeze(1)
-
-                # y = y.float().view(-1, 1).to(self.device)
-                y = y.float().view(-1).to(self.device)
-                # self.optimizer.zero_grad()
-                # local_train_online_loss = self.balanced_softmax_loss(y,online_output,self.sample_per_class)
-                local_train_online_loss= self.loss(online_output,y)  #在线模型本地训练损失
-                # local_train_offline_loss = self.balanced_softmax_loss(y,offline_output,self.sample_per_class)
-                local_train_offline_loss = self.offline_loss(offline_output,y)   #离线模型本地训练损失
-
-                # 关系蒸馏 - 在反向传播前添加
-                if global_rounds > 10 and self.relation_kd_enabled:  # 原版是 global_rounds > 0
-                    offline_feature_detached = offline_feature.detach()
-                    online_feature_detached = online_feature.detach()
-
-                    relation_kd_loss_online = self.compute_relation_distillation(online_feature,
-                                                                                 offline_feature_detached)
-                    relation_kd_loss_offline = self.compute_relation_distillation(offline_feature,
-                                                                                  online_feature_detached)
-
-                    # 降低知识蒸馏权重（原版self.relation_kd_weight，现在乘以0.5）
-                    kd_weight = self.relation_kd_weight * 0.5
-                    total_online_loss = local_train_online_loss + kd_weight * relation_kd_loss_online
-                    total_offline_loss = local_train_offline_loss + kd_weight * relation_kd_loss_offline
-                else:
-                    total_online_loss = local_train_online_loss
-                    total_offline_loss = local_train_offline_loss
-
-                mu = getattr(self, 'fedprox_mu', 0.0)
-                if mu > 0:
-                    global_snapshot = getattr(self, 'initial_params', None)
-                    offline_snapshot = getattr(self, 'initial_offline_params', None)
-
-                    if global_snapshot is not None:
-                        prox_online = self.apply_fedprox_proximal(self.model, global_snapshot, mu)
-                        total_online_loss = total_online_loss + prox_online
-
-                    if offline_snapshot is not None:
-                        prox_offline = self.apply_fedprox_proximal(self.offline_model, offline_snapshot, mu)
-                        total_offline_loss = total_offline_loss + prox_offline
-
-                self.optimizer.zero_grad()
-                total_online_loss.backward()
-                self.optimizer.step()
-
-                self.offline_optimizer.zero_grad()
-                total_offline_loss.backward()
-                self.offline_optimizer.step()
-
-
-
-                # 累计总损失
-                sum_total_online_loss += total_online_loss.item()
-                sum_total_offline_loss += total_offline_loss.item()
-                # print(f"Final - total_online_loss: {total_online_loss.item()}")
-                # print(f"Final - total_offline_loss: {total_offline_loss.item()}")
-                # 批次计数
-                num_batches += 1
-
-
-                # 计算当前批次的梯度2范数并累加到总梯度范数中
-                batch_norm = 0.0
-                for name, p in self.model.named_parameters():
-                    if name != 'scaling' and p.grad is not None:  # 明确排除 scaling 参数
-                        param_norm = p.grad.data.norm(2)
-                        batch_norm += param_norm.item() ** 2
-                batch_norm = batch_norm ** 0.5
-                total_gradient_norm += batch_norm
-                total_batches += 1
-            if epoch == max_local_epochs - 1:  # 只在最后一轮本地训练记录
-                with torch.no_grad():
-                    # 快速测试一个batch
-                    test_batch_x, test_batch_y = next(iter(trainloader))
-
-                    # 关键修复：确保测试数据在GPU上
-                    if type(test_batch_x) == type([]):
-                        test_batch_x[0] = test_batch_x[0].to(self.device)
-                    else:
-                        test_batch_x = test_batch_x.to(self.device)
-                    test_batch_y = test_batch_y.to(self.device)
-
-                    # 现在可以安全调用模型
-                    online_output = self.model(test_batch_x)
-                    offline_output = self.offline_structure['全局'](
-                        test_batch_x) if '全局' in self.offline_structure else self.offline_model(test_batch_x)
-
-                    online_acc = ((torch.sigmoid(online_output) > 0.5) == test_batch_y).float().mean()
-                    offline_acc = ((torch.sigmoid(offline_output) > 0.3) == test_batch_y).float().mean()
-
-                    # 检测异常
-                    anomaly = self.check_anomaly(sum_total_online_loss, sum_total_offline_loss, online_acc, offline_acc)
-
-                    # 记录梯度信息（仅异常时）
-                    self.log_gradient_norms()
-
-                    # 记录激活值（仅异常时）
-                    self.log_extreme_activations(online_output)
-                    self.log_extreme_activations(offline_output)
-
-                    # 简化输出：每个客户端训练完只打印一行
-                    if anomaly or self.id == 0:  # 异常时或第一个客户端时打印
-                        print(
-                            f"[CLIENT {self.id}] Loss: Online={sum_total_online_loss:.3f} Offline={sum_total_offline_loss:.3f} | Acc: Online={online_acc:.3f} Offline={offline_acc:.3f} {'⚠️' if anomaly else ''}")
-
-        # 计算平均训练损失用于相似度计算
-        if num_batches > 0:
-            self.current_train_loss = sum_total_online_loss / num_batches
-        else:
-            self.current_train_loss = 0.0
-
-        # 记录模型更新（如果有初始参数记录）
-        if hasattr(self, 'initial_params'):
-            model_update = {}
-            for name, param in self.model.named_parameters():
-                if name in self.initial_params:
-                    model_update[name] = param.data - self.initial_params[name]
-            # 这个更新将在服务器端的receive函数中被收集
-
-        self.grad_norm.append(total_gradient_norm / total_batches)
-
-        if self.learning_rate_decay:
-            self.online_learning_rate_scheduler.step()
-        if self.offline_learning_rate_decay:
-            self.offline_learning_rate_scheduler.step()
-
-        self.train_time_cost['num_rounds'] += 1
-        self.train_time_cost['total_cost'] += time.time() - start_time
 
     def train_layered(self, layer_idx, round_idx, num_clients, alpha):
         """
@@ -295,25 +99,134 @@ class clientMyMethod(clientAVG):
         # -------------------------------------------------------------------
         trainloader = self.load_train_data()
 
-        # 两个模型都设置为训练模式，因为它们都将被更新
+
+
+
+        features = []
+        labels = []
+        for x, y in trainloader:
+            features.append(x.view(x.size(0), -1).numpy())
+            labels.append(y.numpy())
+
+        features = np.concatenate(features, axis=0)
+        labels = np.concatenate(labels, axis=0)
+
+        # 检查欺诈样本数量
+        fraud_count = Counter(labels)[1]
+        normal_count = Counter(labels)[0]
+
+        labels_resampled_for_pos_weight = []
+
+        if fraud_count > 0:
+            # 根据原始数据计算 pos_weight
+            stable_pos_weight = torch.tensor(normal_count / fraud_count).to(self.device)
+        else:
+            stable_pos_weight = torch.tensor(1.0).to(self.device)
+
+        # 然后再对数据进行 SMOTE
+        # self.train_data = smote(self.train_data) # MOTE 调用
+        stable_pos_weight = torch.clamp(stable_pos_weight, min=1.0, max=5.0)
+        # 将 pos_weight 传给损失函数
+        # local_criterion = nn.BCEWithLogitsLoss(pos_weight=stable_pos_weight)
+        offline_criterion = nn.BCEWithLogitsLoss(pos_weight=stable_pos_weight)
+        online_criterion = nn.BCEWithLogitsLoss()
+        print(f"客户端 {self.id}: 本地训练，根据原始数据计算出的 pos_weight 值为: {stable_pos_weight.item():.2f}")
+
+
+        # 欺诈与非欺诈不一样就用 SMOTE
+        if fraud_count != normal_count:
+            # print(f"客户端 {self.id}: 本地欺诈样本数量：{fraud_count}，正常样本数量：{normal_count}")
+
+            # 只有当正负样本都存在时，才进行数据增强
+            if fraud_count > 0 and normal_count > 0:
+                try:
+                    # 动态判断少数类，并定义过采样策略
+                    if fraud_count > normal_count:
+                        # 如果欺诈样本更多，则将正常样本（0）视为少数类
+                        minority_class_count = normal_count
+                        sampling_strategy = {0: fraud_count}
+                    else:
+                        # 如果正常样本更多，则将欺诈样本（1）视为少数类
+                        minority_class_count = fraud_count
+                        sampling_strategy = {1: normal_count}
+
+                    # 根据少数类样本数量选择合适的过采样方法
+                    if minority_class_count > 1:
+                        # 如果有多个少数类样本，使用 SMOTE
+                        k_neighbors = min(minority_class_count - 1, 5)
+                        sampler = SMOTE(sampling_strategy=sampling_strategy, k_neighbors=k_neighbors, random_state=42)
+                    else:
+                        # 如果只有1个少数类样本，使用 RandomOverSampler
+                        sampler = RandomOverSampler(sampling_strategy=sampling_strategy, random_state=42)
+
+                    # 执行数据增强
+                    features_resampled, labels_resampled = sampler.fit_resample(features, labels)
+                    #打印新的样本分布，以便调试
+                    print(f"客户端 {self.id}: 增强后欺诈样本数量：{Counter(labels_resampled)[1]}，正常样本数量：{Counter(labels_resampled)[0]}")
+
+                    labels_resampled_for_pos_weight = labels_resampled
+
+                    # 将增强后的数据转换回 TensorDataset
+                    resampled_dataset = torch.utils.data.TensorDataset(
+                        torch.from_numpy(features_resampled).float(),
+                        torch.from_numpy(labels_resampled).long()
+                    )
+
+                    # 创建一个新的 trainloader
+                    trainloader = torch.utils.data.DataLoader(
+                        dataset=resampled_dataset,
+                        batch_size=self.batch_size,
+                        shuffle=True,
+                        drop_last=True
+                    )
+                except Exception as e:
+                    print(f"客户端 {self.id}: 数据增强失败，跳过。错误: {e}")
+            else:
+                print()
+                # print(f"客户端 {self.id}: 无法进行数据增强，正负样本数量之一为零。")
+
+        # # 根据增强的样本自适应改变pos_weight
+        # if len(labels_resampled_for_pos_weight) == 0:
+        #     # 如果数据增强失败或没有样本，我们无法计算 pos_weight，保持默认值
+        #     stable_pos_weight = torch.tensor(1.0).to(self.device)
+        # else:
+        #     # 使用 Counter 计算增强后的样本总数
+        #     resampled_counts = Counter(labels_resampled_for_pos_weight)
+        #     pos_count_total = resampled_counts[1]
+        #     neg_count_total = resampled_counts[0]
+        #
+        #     # 避免除以零
+        #     if pos_count_total > 0:
+        #         stable_pos_weight = torch.tensor(neg_count_total / pos_count_total).to(self.device)
+        #     else:
+        #         stable_pos_weight = torch.tensor(1.0).to(self.device)
+        #
+        #     # 保持你原来的 pos_weight 约束
+        #     stable_pos_weight = torch.clamp(stable_pos_weight, min=1.0, max=50.0)
+        #     print(f"客户端 {self.id}: 本地训练，计算出的 pos_weight 值为: {stable_pos_weight.item():.2f}")
+        # local_criterion = nn.BCEWithLogitsLoss(pos_weight=stable_pos_weight)
+
+
         self.model.train()  # 在线模型
         self.offline_model.train()  # 离线模型
         self.model.to(self.device)
         self.offline_model.to(self.device)
 
-        # 在这个协同训练方案中，我们更新整个模型，而不是特定的层级
-        # 确保优化器是为整个模型设置的
-        # 这里我们保留你原有的双优化器设置
 
         # -------------------------------------------------------------------
         # 步骤 2: 训练循环和损失计算
         # -------------------------------------------------------------------
         epoch_losses = []
 
+        #fednova
+        num_steps = 0
+        total_online_loss_sum = 0
+        total_offline_loss_sum = 0
+
         max_local_epochs = self.local_epochs
         if self.train_slow:
             max_local_epochs = np.random.randint(1, max_local_epochs // 2)
-
+        count = 3
         for epoch in range(max_local_epochs):
             batch_losses = []
             for step, (x, y) in enumerate(trainloader):
@@ -326,6 +239,18 @@ class clientMyMethod(clientAVG):
                 if x.ndim > 2:
                     x = x.view(x.size(0), -1)
 
+                # 修复点：在每个批次中动态计算 pos_weight
+                # pos_count = (y == 1).sum().float()
+                # neg_count = (y == 0).sum().float()
+                #
+                # if pos_count > 0:
+                #     pos_weight = neg_count / pos_count
+                #     pos_weight = torch.clamp(pos_weight, min=1.0, max=50.0)  # 保持你原来的约束
+                # else:
+                #     pos_weight = torch.tensor(1.0)
+                # local_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(self.device))
+
+
                 # 教师模型（在线模型）前向传播
                 # 这里的在线模型是教师，但它也会被更新，所以不使用 torch.no_grad()
                 teacher_output = self.model(x)
@@ -333,19 +258,35 @@ class clientMyMethod(clientAVG):
                 # 学生模型（离线模型）前向传播
                 student_output = self.offline_model(x)
 
+                if torch.isnan(teacher_output).any() or torch.isinf(teacher_output).any():
+                    print(f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，teacher_output 包含 NaN/Inf！")
+                    # 可以在这里添加断点，或直接结束训练以定位问题
+                    return
+                if torch.isnan(student_output).any() or torch.isinf(student_output).any():
+                    print(f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，student_output 包含 NaN/Inf！")
+                    return
+
+
                 # 统一输出维度
                 if student_output.dim() > 1:
                     student_output = student_output.squeeze()
                 if teacher_output.dim() > 1:
                     teacher_output = teacher_output.squeeze()
 
-                local_train_online_loss = self.loss(teacher_output, y)
-                local_train_offline_loss = self.offline_loss(student_output, y)
+                local_train_online_loss = online_criterion(teacher_output, y)
+                local_train_offline_loss = offline_criterion(student_output, y)
+
+                if torch.isnan(local_train_online_loss).any() or torch.isinf(local_train_online_loss).any():
+                    print(f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，online_loss 包含 NaN/Inf！")
+                    return
+                if torch.isnan(local_train_offline_loss).any() or torch.isinf(local_train_offline_loss).any():
+                    print(f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，offline_loss 包含 NaN/Inf！")
+                    return
 
                 if round_idx != 0:
                     # 计算知识蒸馏损失
-                    # 学生（离线）向教师（在线）学习
-                    kd_loss_offline_to_online = self.compute_kd_loss(student_output, teacher_output, y, alpha)
+                    # # 学生（离线）向教师（在线）学习
+                    # kd_loss_offline_to_online = self.compute_kd_loss(student_output, teacher_output, y, alpha)
 
                     # 额外增加一个反向的蒸馏损失，让在线模型也从离线模型的本地知识中学习
                     kd_loss_online_to_offline = self.compute_kd_loss(teacher_output, student_output, y, alpha)
@@ -354,7 +295,11 @@ class clientMyMethod(clientAVG):
                     # 在线模型总损失 = 硬标签损失 + 反向蒸馏损失
                     total_online_loss = local_train_online_loss + kd_loss_online_to_offline
                     # 离线模型总损失 = 硬标签损失 + 蒸馏损失
-                    total_offline_loss = local_train_offline_loss + kd_loss_offline_to_online
+                    # total_offline_loss = local_train_offline_loss + kd_loss_offline_to_online
+                    total_offline_loss = local_train_offline_loss
+
+                    if step == len(trainloader) - 1 and epoch == max_local_epochs - 1:
+                        print(f"客户端 {self.id} 的蒸馏损失 kd_loss: {kd_loss_online_to_offline.item():.4f}")
 
                 # -------------------------------------------------------------------
                 # 步骤 3: 损失组合和反向传播
@@ -366,56 +311,99 @@ class clientMyMethod(clientAVG):
                     # 离线模型总损失 = 硬标签损失 + 蒸馏损失
                     total_offline_loss = local_train_offline_loss
 
-                # 应用 FedProx 或其他正则化
-                mu = getattr(self, 'fedprox_mu', 0.0)
-                if mu > 0:
-                    global_snapshot = getattr(self, 'initial_params', None)
-                    offline_snapshot = getattr(self, 'initial_offline_params', None)
-                    if global_snapshot is not None:
-                        prox_online = self.apply_fedprox_proximal(self.model, global_snapshot, mu)
-                        total_online_loss += prox_online
-                    if offline_snapshot is not None:
-                        prox_offline = self.apply_fedprox_proximal(self.offline_model, offline_snapshot, mu)
-                        total_offline_loss += prox_offline
+
 
                 # -------------------------------------------------------------------
                 # 步骤 4: 优化两个模型
                 # -------------------------------------------------------------------
                 #考虑onlineloss和offlineloss权重？-----------------------------------------------------------------
                 total_loss = total_online_loss + total_offline_loss
+                if step == len(trainloader) - 1 and epoch == max_local_epochs - 1:
+                    print(f"客户端 {self.id}: 训练轮次 {round_idx}, 本地训练第 {epoch} 轮, 在线损失: {total_online_loss.item():.4f}, 离线损失: {total_offline_loss.item():.4f}, 总损失: {total_loss.item():.4f}")
+
                 self.optimizer.zero_grad()
                 self.offline_optimizer.zero_grad()
                 total_loss.backward()
 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=1.0)
+                # 记录用于 FedNova 的步数和损失
+                num_steps += 1
+                total_online_loss_sum += total_online_loss.item()
+                total_offline_loss_sum += total_offline_loss.item()
+
+                online_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
+                offline_grad_norm = torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=0.1)
+                if step == len(trainloader) - 1 and epoch == max_local_epochs - 1:
+                    # online_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float('inf'))
+                    # offline_grad_norm = torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(),
+                    #                                                    max_norm=float('inf'))
+
+                    print(
+                        f"客户端 {self.id}: 全局训练第 {round_idx}轮, 本地训练第 {epoch}轮, "
+                        f"在线模型梯度范数: {online_grad_norm:.4f}, "
+                        f"离线模型梯度范数: {offline_grad_norm:.4f}"
+                    )
+
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        print(
+                            f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，模型 {name} 的梯度包含 NaN/Inf！")
+                        return
+                for name, param in self.offline_model.named_parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        print(
+                            f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，离线模型 {name} 的梯度包含 NaN/Inf！")
+                        return
+
+
+
                 # 执行优化步骤
                 self.optimizer.step()
                 self.offline_optimizer.step()
 
-                # # 优化在线模型
-                # self.optimizer.zero_grad()
-                # total_online_loss.backward()
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                # self.optimizer.step()
-                #
-                # # 优化离线模型
-                # self.offline_optimizer.zero_grad()
-                # total_offline_loss.backward()
-                # torch.nn.utils.clip_grad_norm_(self.offline_model.parameters(), max_norm=1.0)
-                # self.offline_optimizer.step()
+                for name, param in self.model.named_parameters():
+                    if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                        print(
+                            f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，模型 {name} 的参数包含 NaN/Inf！")
+                        return
+
 
                 batch_losses.append(total_online_loss.item())
 
             epoch_loss = sum(batch_losses) / len(batch_losses)
             epoch_losses.append(epoch_loss)
 
+            count = count - 1
+
             # -------------------------------------------------------------------
             # 步骤 5: 更新历史信息
             # -------------------------------------------------------------------
         self.online_structure[layer_idx] = copy.deepcopy(self.model).state_dict()
         self.offline_structure[layer_idx] = copy.deepcopy(self.offline_model).state_dict()
-        # 在这个方案中，两个模型都通过优化器更新，所以不需要动量更新
+
+        # self.latest_model_params = {
+        #     name: param for name, param in self.model.named_parameters()
+        # }
+
+        # 本地模型在公共验证集上的性能评估
+        local_performance_metric = 0.0
+        if self.public_val_loader is not None:
+            self.model.eval()
+            all_labels = []
+            all_preds_binary = []
+            with torch.no_grad():
+                for x, y in self.public_val_loader:
+                    x, y = x.to(self.device), y.to(self.device).float()
+                    output = self.model(x).squeeze()
+                    preds_binary = (torch.sigmoid(output) > 0.5).long()
+                    all_labels.extend(y.cpu().numpy())
+                    all_preds_binary.extend(preds_binary.cpu().numpy())
+            try:
+                local_performance_metric = f1_score(all_labels, all_preds_binary, zero_division=0)
+            except Exception as e:
+                print(f"客户端 {self.id}: 计算 F1-Score 失败，错误: {e}")
+                local_performance_metric = 0.0
+            self.local_f1_score = local_performance_metric
+
 
         # 计算平均训练损失并更新历史信息
         avg_loss = sum(epoch_losses) / len(epoch_losses)
@@ -423,7 +411,46 @@ class clientMyMethod(clientAVG):
         global_loss = getattr(self, 'received_global_loss', self.global_loss)
         self.update_lr_history(avg_loss, global_loss, round_idx)
 
-        print(f"[CLIENT {self.id}] 协同训练完成, 平均损失: {avg_loss:.4f}")
+
+        # initial_params_dict = getattr(self, 'initial_params', None)
+        #
+        # current_params_dict = {name: param.data for name, param in self.model.named_parameters()}
+        #
+        # if initial_params_dict is not None:
+        #     param_increment = {
+        #         name: current_params_dict[name] - initial_params_dict[name]
+        #         for name in current_params_dict
+        #     }
+        #
+        #     if not self.latest_model_params:
+        #         self.latest_model_params = param_increment
+        #     else:
+        #         for name in self.latest_model_params:
+        #             self.latest_model_params[name] += param_increment[name]
+
+        # >>> 新增 FedNova 所需的上传信息
+        # 计算客户端模型参数相对于初始全局模型的增量
+        initial_online_params = getattr(self, 'initial_params', None)
+
+        # 仅针对可训练参数计算增量
+        delta_online_params = {}
+        if initial_online_params is not None:
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:  # 检查参数是否需要梯度
+                    # 确保 initial_online_params 中包含该键，以防意外
+                    if name in initial_online_params:
+                        # 计算当前参数与初始全局参数的差值
+                        delta_online_params[name] = param.data - initial_online_params[name]
+        else:
+            # 在 round 0，如果无法获取初始全局模型，则使用本地模型的所有可训练参数
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    delta_online_params[name] = param.data
+
+        self.latest_model_params = {
+            'model_params': self.model.state_dict(),
+            'num_samples': self.train_samples
+        }
 
 
 
@@ -469,24 +496,24 @@ class clientMyMethod(clientAVG):
         # for key in self.offline_structure.keys():
         #     self.offline_structure[key].to(self.device)
 
-    def compute_consistency_loss(self, online_features, offline_features):
-        """添加特征一致性损失"""
-        return F.mse_loss(online_features, offline_features.detach())
+    # def compute_consistency_loss(self, online_features, offline_features):
+    #     """添加特征一致性损失"""
+    #     return F.mse_loss(online_features, offline_features.detach())
 
 
 
-    def compute_dynamic_weights(self, online_loss, offline_loss):
-
-        total_loss = online_loss.detach() + offline_loss.detach()
-        online_weight_temp = online_loss / total_loss
-        online_weight = 1 - online_weight_temp
-        offline_weight_temp = offline_loss / total_loss
-        offline_weight = 1 - offline_weight_temp
-
-
-
-        return online_weight, offline_weight
-
+    # def compute_dynamic_weights(self, online_loss, offline_loss):
+    #
+    #     total_loss = online_loss.detach() + offline_loss.detach()
+    #     online_weight_temp = online_loss / total_loss
+    #     online_weight = 1 - online_weight_temp
+    #     offline_weight_temp = offline_loss / total_loss
+    #     offline_weight = 1 - offline_weight_temp
+    #
+    #
+    #
+    #     return online_weight, offline_weight
+    #
 
 
 
@@ -494,56 +521,56 @@ class clientMyMethod(clientAVG):
 
 
 
-    def compute_relation_distillation(self, online_features, offline_features):
-        """特征层面的关系蒸馏"""
-        batch_size = online_features.size(0)
+    # def compute_relation_distillation(self, online_features, offline_features):
+    #     """特征层面的关系蒸馏"""
+    #     batch_size = online_features.size(0)
+    #
+    #     # 批次太小时跳过关系蒸馏
+    #     if batch_size < 2:
+    #         return torch.tensor(0.0, device=online_features.device, requires_grad=True)
+    #
+    #     try:
+    #         # 计算特征间的欧氏距离矩阵
+    #         online_dist = torch.cdist(online_features, online_features, p=2)
+    #         offline_dist = torch.cdist(offline_features, offline_features, p=2)
+    #
+    #         # 归一化距离矩阵以提高稳定性
+    #         online_dist = online_dist / (online_dist.max() + 1e-8)
+    #         offline_dist = offline_dist / (offline_dist.max() + 1e-8)
+    #
+    #         # 关系一致性损失 - 使用detach()避免梯度循环
+    #         relation_loss = F.mse_loss(online_dist, offline_dist.detach()) + \
+    #                         F.mse_loss(offline_dist, online_dist.detach())
+    #
+    #         return relation_loss * 0.5  # 取平均
+    #
+    #     except Exception as e:
+    #         print(f"关系蒸馏计算出错: {e}")
+    #         return torch.tensor(0.0, device=online_features.device, requires_grad=True)
 
-        # 批次太小时跳过关系蒸馏
-        if batch_size < 2:
-            return torch.tensor(0.0, device=online_features.device, requires_grad=True)
-
-        try:
-            # 计算特征间的欧氏距离矩阵
-            online_dist = torch.cdist(online_features, online_features, p=2)
-            offline_dist = torch.cdist(offline_features, offline_features, p=2)
-
-            # 归一化距离矩阵以提高稳定性
-            online_dist = online_dist / (online_dist.max() + 1e-8)
-            offline_dist = offline_dist / (offline_dist.max() + 1e-8)
-
-            # 关系一致性损失 - 使用detach()避免梯度循环
-            relation_loss = F.mse_loss(online_dist, offline_dist.detach()) + \
-                            F.mse_loss(offline_dist, online_dist.detach())
-
-            return relation_loss * 0.5  # 取平均
-
-        except Exception as e:
-            print(f"关系蒸馏计算出错: {e}")
-            return torch.tensor(0.0, device=online_features.device, requires_grad=True)
 
 
-
-    def check_anomaly(self, online_loss, offline_loss, online_acc, offline_acc):
-        # 根据训练轮数动态调整阈值
-        if hasattr(self, 'round_count'):
-            # 早期训练：宽松阈值
-            if self.round_count < 10:
-                loss_threshold = 3.0
-            # 中期训练：中等阈值
-            elif self.round_count < 50:
-                loss_threshold = 2.0
-            # 后期训练：严格阈值
-            else:
-                loss_threshold = 1.0
-        else:
-            loss_threshold = 2.0
-
-        # 基于历史损失的相对阈值
-        if hasattr(self, 'loss_history') and len(self.loss_history) >= 5:
-            avg_loss = np.mean(self.loss_history[-5:])
-            std_loss = np.std(self.loss_history[-5:])
-            relative_threshold = avg_loss + 2 * std_loss  # 2倍标准差
-            loss_threshold = min(loss_threshold, relative_threshold)
+    # def check_anomaly(self, online_loss, offline_loss, online_acc, offline_acc):
+    #     # 根据训练轮数动态调整阈值
+    #     if hasattr(self, 'round_count'):
+    #         # 早期训练：宽松阈值
+    #         if self.round_count < 10:
+    #             loss_threshold = 3.0
+    #         # 中期训练：中等阈值
+    #         elif self.round_count < 50:
+    #             loss_threshold = 2.0
+    #         # 后期训练：严格阈值
+    #         else:
+    #             loss_threshold = 1.0
+    #     else:
+    #         loss_threshold = 2.0
+    #
+    #     # 基于历史损失的相对阈值
+    #     if hasattr(self, 'loss_history') and len(self.loss_history) >= 5:
+    #         avg_loss = np.mean(self.loss_history[-5:])
+    #         std_loss = np.std(self.loss_history[-5:])
+    #         relative_threshold = avg_loss + 2 * std_loss  # 2倍标准差
+    #         loss_threshold = min(loss_threshold, relative_threshold)
 
 
     def log_gradient_norms(self):
@@ -566,39 +593,6 @@ class clientMyMethod(clientAVG):
 
         if model_output.abs().max() > 10:
             print(f"    [CLIENT {self.id}] ACTIVATION WARNING: Max={model_output.abs().max().item():.3f}")
-
-    def analyze_data_locally(self,train_loader):
-        """完全本地化的数据分析 - 无隐私泄露"""
-        try:
-            # train_loader = self.load_train_data()
-            positive_count = 0
-            total_count = 0
-
-            for x, y in train_loader:
-                positive_count += y.sum().item()
-                total_count += len(y)
-
-            self.local_fraud_rate = positive_count / total_count if total_count > 0 else 0
-
-            # 仅基于本地数据调整学习策略，不向外传输任何信息
-            if self.local_fraud_rate > 0.15:
-                # 高欺诈率：降低学习率，增加正则化
-                self.learning_rate *= 0.8
-                self.client_adaptation = "conservative"
-            elif self.local_fraud_rate < 0.02:
-                # 低欺诈率：可能需要更敏感的学习
-                self.learning_rate *= 1.1
-                self.client_adaptation = "sensitive"
-            else:
-                self.client_adaptation = "standard"
-
-            # 只在本地记录，不传输
-            print(f"Client {self.id}: Local adaptation = {self.client_adaptation}")
-
-        except Exception as e:
-            print(f"Client {self.id}: Local analysis failed: {e}")
-            self.local_fraud_rate = 0.05
-            self.client_adaptation = "standard"
 
 
     def apply_fedprox_proximal(self, model, global_params_dict, mu):
@@ -660,161 +654,159 @@ class clientMyMethod(clientAVG):
             return 1
         else:
             return 2
+
 #----------------------------------------------------------------------------------------------------------------
-    def update_teacher_momentum(self):
-        """动量更新Teacher模型"""
-        self.teacher_model.to(self.device)
-        self.model.to(self.device)
-        with torch.no_grad():
-            for teacher_param, student_param in zip(
-                    self.teacher_model.parameters(),
-                    self.model.parameters()
-            ):
-                teacher_param.data = (
-                        self.momentum_tau * teacher_param.data +
-                        (1 - self.momentum_tau) * student_param.data
-                )
+    # def update_teacher_momentum(self):
+    #     """动量更新Teacher模型"""
+    #     self.teacher_model.to(self.device)
+    #     self.model.to(self.device)
+    #     with torch.no_grad():
+    #         for teacher_param, student_param in zip(
+    #                 self.teacher_model.parameters(),
+    #                 self.model.parameters()
+    #         ):
+    #             teacher_param.data = (
+    #                     self.momentum_tau * teacher_param.data +
+    #                     (1 - self.momentum_tau) * student_param.data
+    #             )
 
     def compute_kd_loss(self, student_logits, teacher_logits, labels, alpha):
-        """计算单向知识蒸馏损失"""
-        # 硬标签损失
+        """二分类计算单向知识蒸馏损失"""
         hard_loss = F.binary_cross_entropy_with_logits(student_logits, labels)
 
-        # 软标签损失（KL散度）
-        student_probs = torch.sigmoid(student_logits / self.temperature)
-        teacher_probs = torch.sigmoid(teacher_logits / self.temperature)
-
-        soft_loss = F.kl_div(
-            torch.log(student_probs + 1e-8),
-            teacher_probs,
-            reduction='batchmean'
-        ) * (self.temperature ** 2)
+        # 软标签损失：让学生模型预测教师模型的“软化”输出
+        # 这里我们使用教师模型的软化 logits 作为目标
+        # 不需要显式地计算概率，直接使用 BCEWithLogitsLoss
+        soft_loss = F.binary_cross_entropy_with_logits(
+            student_logits / self.temperature,
+            (teacher_logits / self.temperature).sigmoid().detach()
+        )
 
         # 组合损失
         total_loss = alpha * hard_loss + (1 - alpha) * soft_loss
         return total_loss
 
-    def train_layer_specific(self, layer_idx, round_idx, num_clients, alpha):#已经废弃！！！！！！！！！！！！！！！！！
-        """单向teacher-student架构的层级训练"""
-        trainloader = self.load_train_data()
-        # self.model.train()
-        # self.teacher_model.eval()
-        #
-        # self.teacher_model.to(self.device)
-        # self.model.to(self.device)
+    # def train_layer_specific(self, layer_idx, round_idx, num_clients, alpha):#已经废弃！！！！！！！！！！！！！！！！！
+    #     """单向teacher-student架构的层级训练"""
+    #     trainloader = self.load_train_data()
+    #     # self.model.train()
+    #     # self.teacher_model.eval()
+    #     #
+    #     # self.teacher_model.to(self.device)
+    #     # self.model.to(self.device)
+    #
+    #     # 确保正在训练正确的层级
+    #     if layer_idx not in self.online_structure:
+    #         print(f"警告: 客户端 {self.id} 在 {layer_idx} 层找不到模型")
+    #         return
+    #
+    #     # 获取当前层的学生和教师模型模块
+    #     student_model_layer = self.online_structure[layer_idx]
+    #     teacher_model_layer = self.offline_structure[layer_idx]
+    #
+    #     student_model_layer.train()
+    #     teacher_model_layer.eval()
+    #     self.model.train()
+    #     self.offline_model.eval()
+    #     self.model.to(self.device)
+    #     self.offline_model.to(self.device)
+    #     student_model_layer.to(self.device)
+    #     teacher_model_layer.to(self.device)
+    #
+    #     # === 设置自适应学习率 ===
+    #     optimizer = torch.optim.Adam(student_model_layer.parameters(), lr=self.get_adaptive_lr())
+    #
+    #     trainloader = self.load_train_data()
+    #     epoch_losses = []
+    #
+    #     epoch_losses = []
+    #
+    #     # 本地训练轮次
+    #     for epoch in range(self.local_epochs):
+    #         batch_losses = []
+    #
+    #         for step, (x, y) in enumerate(trainloader):
+    #             if self.train_slow:
+    #                 time.sleep(0.1 * np.abs(np.random.rand()))
+    #
+    #             x, y = x.to(self.device), y.to(self.device).float()
+    #             if y.dim() > 1:
+    #                 y = y.squeeze()
+    #             if x.ndim > 2:
+    #                 x = x.view(x.size(0), -1)
+    #
+    #             with torch.no_grad():
+    #                 # 教师模型前向传播
+    #                 teacher_features = self.offline_model.produce_feature(x)
+    #                 teacher_output = self.offline_model.classifier(teacher_features)
+    #
+    #             # 学生模型前向传播
+    #             # 如果训练的是分类器，需要先用特征提取器获取特征
+    #             if layer_idx == 1:
+    #                 with torch.no_grad():
+    #                     student_features = self.model.produce_feature(x)
+    #                 student_output = student_model_layer(student_features)
+    #             # 如果训练的是特征提取器，直接前向传播
+    #             else:
+    #                 student_features = student_model_layer.produce_feature(x)
+    #                 student_output = self.model.classifier(student_features)
+    #
+    #             if student_output.dim() > 1:
+    #                 student_output = student_output.squeeze()
+    #             if teacher_output.dim() > 1:
+    #                 teacher_output = teacher_output.squeeze()
+    #
+    #             # 计算知识蒸馏损失
+    #             loss = self.compute_kd_loss(student_output, teacher_output, y, alpha)
+    #
+    #             optimizer.zero_grad()
+    #             loss.backward()
+    #             # 梯度裁剪防止爆炸
+    #             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+    #             optimizer.step()
+    #             batch_losses.append(loss.item())
+    #
+    #         epoch_loss = sum(batch_losses) / len(batch_losses)
+    #         epoch_losses.append(epoch_loss)
+    #
+    #         # 每个epoch结束后更新teacher
+    #         self.update_teacher_momentum()
+    #
+    #     # 计算平均训练损失并更新历史信息
+    #     avg_loss = sum(epoch_losses) / len(epoch_losses)
+    #     self.training_loss = avg_loss  # 保存训练损失供服务器使用
+    #
+    #     # 注意：global_loss需要从服务器获取，这里暂时使用1.0
+    #     global_loss = getattr(self, 'received_global_loss', self.global_loss)
+    #     self.update_lr_history(avg_loss, global_loss, round_idx)
+    #
+    #     print(f"[CLIENT {self.id}] 第{layer_idx}层训练完成, 平均损失: {avg_loss:.4f}")
 
-        # 确保正在训练正确的层级
-        if layer_idx not in self.online_structure:
-            print(f"警告: 客户端 {self.id} 在 {layer_idx} 层找不到模型")
-            return
-
-        # 获取当前层的学生和教师模型模块
-        student_model_layer = self.online_structure[layer_idx]
-        teacher_model_layer = self.offline_structure[layer_idx]
-
-        student_model_layer.train()
-        teacher_model_layer.eval()
-        self.model.train()
-        self.offline_model.eval()
-        self.model.to(self.device)
-        self.offline_model.to(self.device)
-        student_model_layer.to(self.device)
-        teacher_model_layer.to(self.device)
-
-        # === 设置自适应学习率 ===
-        optimizer = torch.optim.Adam(student_model_layer.parameters(), lr=self.get_adaptive_lr())
-
-        trainloader = self.load_train_data()
-        epoch_losses = []
-
-        epoch_losses = []
-
-        # 本地训练轮次
-        for epoch in range(self.local_epochs):
-            batch_losses = []
-
-            for step, (x, y) in enumerate(trainloader):
-                if self.train_slow:
-                    time.sleep(0.1 * np.abs(np.random.rand()))
-
-                x, y = x.to(self.device), y.to(self.device).float()
-                if y.dim() > 1:
-                    y = y.squeeze()
-                if x.ndim > 2:
-                    x = x.view(x.size(0), -1)
-
-                with torch.no_grad():
-                    # 教师模型前向传播
-                    teacher_features = self.offline_model.produce_feature(x)
-                    teacher_output = self.offline_model.classifier(teacher_features)
-
-                # 学生模型前向传播
-                # 如果训练的是分类器，需要先用特征提取器获取特征
-                if layer_idx == 1:
-                    with torch.no_grad():
-                        student_features = self.model.produce_feature(x)
-                    student_output = student_model_layer(student_features)
-                # 如果训练的是特征提取器，直接前向传播
-                else:
-                    student_features = student_model_layer.produce_feature(x)
-                    student_output = self.model.classifier(student_features)
-
-                if student_output.dim() > 1:
-                    student_output = student_output.squeeze()
-                if teacher_output.dim() > 1:
-                    teacher_output = teacher_output.squeeze()
-
-                # 计算知识蒸馏损失
-                loss = self.compute_kd_loss(student_output, teacher_output, y, alpha)
-
-                optimizer.zero_grad()
-                loss.backward()
-                # 梯度裁剪防止爆炸
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-                batch_losses.append(loss.item())
-
-            epoch_loss = sum(batch_losses) / len(batch_losses)
-            epoch_losses.append(epoch_loss)
-
-            # 每个epoch结束后更新teacher
-            self.update_teacher_momentum()
-
-        # 计算平均训练损失并更新历史信息
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
-        self.training_loss = avg_loss  # 保存训练损失供服务器使用
-
-        # 注意：global_loss需要从服务器获取，这里暂时使用1.0
-        global_loss = getattr(self, 'received_global_loss', self.global_loss)
-        self.update_lr_history(avg_loss, global_loss, round_idx)
-
-        print(f"[CLIENT {self.id}] 第{layer_idx}层训练完成, 平均损失: {avg_loss:.4f}")
-
-    def get_adaptive_lr(self):
-        """基于性能自适应调整学习率"""
-        # Warmup阶段
-        if self.current_round < self.warmup_rounds:
-            return self.base_lr * (self.current_round + 1) / self.warmup_rounds
-
-        # 基于损失变化率调整
-        if len(self.loss_history) >= 2:
-            recent_change = abs(self.loss_history[-1] - self.loss_history[-2])
-            if recent_change < 0.01:  # 收敛缓慢
-                self.convergence_rate *= 1.1
-            elif recent_change > 0.5:  # 震荡过大
-                self.convergence_rate *= 0.8
-
-        # 基于全局-本地性能差异
-        performance_gap = abs(self.last_loss - self.global_loss) / (self.global_loss + 1e-8)
-        gap_factor = 1.0 + 0.2 * performance_gap
-
-        adaptive_lr = (self.base_lr *
-                       self.convergence_rate *
-                       gap_factor *
-                       (self.decay_factor ** (self.current_round - self.warmup_rounds)))
-
-        # 限制学习率范围
-        return max(1e-5, min(0.01, adaptive_lr))
+    # def get_adaptive_lr(self):
+    #     """基于性能自适应调整学习率"""
+    #     # Warmup阶段
+    #     if self.current_round < self.warmup_rounds:
+    #         return self.base_lr * (self.current_round + 1) / self.warmup_rounds
+    #
+    #     # 基于损失变化率调整
+    #     if len(self.loss_history) >= 2:
+    #         recent_change = abs(self.loss_history[-1] - self.loss_history[-2])
+    #         if recent_change < 0.01:  # 收敛缓慢
+    #             self.convergence_rate *= 1.1
+    #         elif recent_change > 0.5:  # 震荡过大
+    #             self.convergence_rate *= 0.8
+    #
+    #     # 基于全局-本地性能差异
+    #     performance_gap = abs(self.last_loss - self.global_loss) / (self.global_loss + 1e-8)
+    #     gap_factor = 1.0 + 0.2 * performance_gap
+    #
+    #     adaptive_lr = (self.base_lr *
+    #                    self.convergence_rate *
+    #                    gap_factor *
+    #                    (self.decay_factor ** (self.current_round - self.warmup_rounds)))
+    #
+    #     # 限制学习率范围
+    #     return max(1e-5, min(0.01, adaptive_lr))
 
     def update_lr_history(self, loss_value, global_loss_value, round_idx):
         """更新学习率调整所需的历史信息"""
@@ -853,6 +845,20 @@ class clientMyMethod(clientAVG):
 
         # 将近似值限制在 [0, 1] 范围内
         return max(0.0, min(1.0, noisy_pos_ratio))
+
+    def load_public_validation_set(self):
+        """加载公共验证集"""
+        public_val_path = "C:\\Users\\Study\\PycharmProjects\\swu-fl\\dataset\\FraudDetection\\public_val_set.npz"
+        if os.path.exists(public_val_path):
+            data = np.load(public_val_path, allow_pickle=True)
+            X_val, y_val = data['x'], data['y']
+            return torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(torch.from_numpy(X_val).float(), torch.from_numpy(y_val).long()),
+                batch_size=self.batch_size,
+                shuffle=False
+            )
+        print("警告: 客户端无法找到公共验证集，基于性能的聚合将退化为平均聚合。")
+        return None
 
 
 # ----------------------------------------------------------------------------------------------------------------

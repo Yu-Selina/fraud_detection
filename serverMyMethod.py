@@ -88,8 +88,10 @@ class MyMethod(FedAvg):
 
         self.initial_global_model = copy.deepcopy(self.global_model)
 
+
+
     # 修改主训练函数
-    def train(self):
+    def train(self):   #启用
         """多层级训练主循环"""
         # 初始化第0层
         self.structure[0][0] = [np.arange(self.num_clients), copy.deepcopy(self.global_model).state_dict()]
@@ -103,19 +105,19 @@ class MyMethod(FedAvg):
             # 训练当前层
             self.train_current_layer(layer)
 
-            # 如果不是最后一层，生成下一层聚类
-            if layer < self.max_layers - 1 and len(self.active_clients_set) > self.min_clients_per_cluster:
-                self.generate_next_layer_clusters(layer)
-            else:
-                print(f"在第 {layer} 层结束训练")
-                break
+            # # 如果不是最后一层，生成下一层聚类
+            # if layer < self.max_layers - 1 and len(self.active_clients_set) > self.min_clients_per_cluster:
+            #     self.generate_next_layer_clusters(layer)
+            # else:
+            #     print(f"在第 {layer} 层结束训练")
+            #     break
 
         # 原有的保存和绘图代码保持不变
         self.save_results()
         self.save_global_model()
         self.plot_metrics()
 
-    def train_current_layer(self, layer):
+    def train_current_layer(self, layer):   #启用
         """训练指定层级的联邦学习"""
 
         print(f"\n开始第 {layer} 层训练")
@@ -138,6 +140,12 @@ class MyMethod(FedAvg):
             print(f"第 {layer} 层生成了 {len(clusters)} 个聚类")
             for i, cluster in enumerate(clusters):
                 print(f"聚类 {i}: 客户端 {cluster}")
+
+        # client_updates = self.collect_client_updates()
+        # clusters = self.adaptive_layer_clustering(client_updates, layer)
+        # print(f"第 {layer} 层生成了 {len(clusters)} 个聚类")
+        # for i, cluster in enumerate(clusters):
+        #     print(f"聚类 {i}: 客户端 {cluster}")
 
         self.initialize_cluster_models(layer, clusters)
         self.send_models_with_classifier(layer, clusters)
@@ -177,13 +185,15 @@ class MyMethod(FedAvg):
                 # 训练聚类内的客户端
                 for client in cluster_clients:
                     # 调用客户端的训练函数
-                    client.train_layered(layer, round_idx, self.num_clients, adaptive_alphas[client.id])
-                    # print("len（client.train_samples）的值为：",len(client.train_samples))
-                    # print("len（client.train_samples）的类型为：",type(len(client.train_samples)))
-                    # 在客户端训练后，立即将模型接收到服务器
-                    self.uploaded_models[cluster_id].append(client.model)
-                    self.uploaded_weights[cluster_id].append(client.train_samples)
-                    self.uploaded_ids[cluster_id].append(client.id)
+                    # if client.id == 0:
+                        client.train_layered(layer, round_idx, self.num_clients, adaptive_alphas[client.id])
+                        # print("len（client.train_samples）的值为：",len(client.train_samples))
+                        # print("len（client.train_samples）的类型为：",type(len(client.train_samples)))
+                        # 在客户端训练后，立即将模型接收到服务器
+                        self.uploaded_models[cluster_id].append(client.model)
+                        self.uploaded_weights[cluster_id].append(client.train_samples)
+                        self.uploaded_ids[cluster_id].append(client.id)
+
                 # client.train(round_idx,self.num_clients)
             # self.receive_models_with_classifier(clusters)
             print(f"第 {layer} 层轮次 {round_idx} 完成客户端训练")
@@ -195,17 +205,18 @@ class MyMethod(FedAvg):
                 print("train_current_layer:no aggregate function!")
             if round_idx % self.eval_gap == 0:
                 self.current_round = round_idx
-                self.evaluate()
+                self.evaluate_clusters_in_layer(layer, clusters)
             #理论驱动的收敛监控
             metrics = {
                 'f1': self.rs_test_f1[-1] if self.rs_test_f1 else 0.0,
                 'auc': self.rs_test_auc[-1] if self.rs_test_auc else 0.5,
                 'recall': self.rs_test_recall[-1] if self.rs_test_recall else 0.0
             }
-
-            if self.fraud_detection_convergence_monitor(layer, round_idx, metrics):
-                print(f"第 {layer} 层在轮次 {round_idx} 早停")
-                break
+#------------------------------------------------------------------------------------#
+            # if self.fraud_detection_convergence_monitor(layer, round_idx, metrics):
+            #     print(f"第 {layer} 层在轮次 {round_idx} 早停")
+            #     break
+# ------------------------------------------------------------------------------------#
 
             # 更新客户端性能记录
             if round_idx % self.eval_gap == 0:
@@ -221,14 +232,14 @@ class MyMethod(FedAvg):
         if layer < self.max_layers - 1:
             self.freeze_current_layer_parameters(layer)
 
-    def select_active_clients(self):
+    def select_active_clients(self):   #启用
         """选择活跃客户端进行训练"""
         active_list = list(self.active_clients_set)
         selected_num = min(self.current_num_join_clients, len(active_list))
         selected_indices = random.sample(active_list, selected_num)
         return [self.clients[i] for i in selected_indices]
 
-    def initialize_cluster_models(self, layer, clusters):
+    def initialize_cluster_models(self, layer, clusters):   #启用
         """
         为指定层级的每个聚类初始化模型。
         """
@@ -248,60 +259,11 @@ class MyMethod(FedAvg):
                 print(f"服务器: 第 {layer} 层，聚类 {cluster_id} 模型参数初始化完成。")
 
 
-    def generate_next_layer_clusters(self, layer_idx):
-        """为下一层生成聚类"""
-        print(f"开始为第 {layer_idx} 层生成聚类...")
-
-        if layer_idx == 0:
-            # 第0层使用全局聚合
-            clusters = [[client.id for client in self.selected_clients]]
-            print("第 0 层采用全局聚合")
-        else:
-            # 收集客户端更新
-            client_updates = self.collect_client_updates()
-            # 使用新的自适应聚类方法
-            cluster_ids = self.adaptive_layer_clustering(client_updates, layer_idx)
-            clusters = cluster_ids
-
-            print(f"第 {layer_idx} 层生成了 {len(clusters)} 个聚类")
-            for i, cluster in enumerate(clusters):
-                print(f"聚类 {i}: 客户端 {cluster}")
-
-        return clusters
-
-    def perform_hierarchical_clustering(self, similarity_matrix):
-        """基于相似度矩阵进行层次聚类"""
-        client_ids = list(similarity_matrix.keys())
-        similarity_threshold = 0.7  # 可以根据需要调整
-
-        clusters = []
-        assigned = set()
-
-        for client_a in client_ids:
-            if client_a in assigned:
-                continue
-
-            cluster = [client_a]
-            assigned.add(client_a)
-
-            # 找到与当前客户端相似的其他客户端
-            for client_b in client_ids:
-                if (client_b not in assigned and
-                        client_b in similarity_matrix[client_a] and
-                        similarity_matrix[client_a][client_b] > similarity_threshold):
-                    cluster.append(client_b)
-                    assigned.add(client_b)
-
-            clusters.append(cluster)
-
-        return clusters
-
-#######################################################################################################################################
 
 
 
 
-    def extract_update_signature(self, client_id):
+    def extract_update_signature(self, client_id):   #启用
         """提取客户端的参数更新签名"""
         if client_id >= len(self.uploaded_models):
             return None
@@ -334,131 +296,9 @@ class MyMethod(FedAvg):
 
         return signature
 
-#######################################################################################################################################
 
 
-    def fedawa_adaptive_aggregation(self, layer):
-        """基于FedAWA理论的自适应层级聚合"""
-        if layer not in self.structure:
-            return
-
-        for cluster_id, (cluster_clients, cluster_model) in self.structure[layer].items():
-            # 收集该聚类中的客户端模型和更新向量
-            client_vectors = []
-            client_weights = []
-            valid_models = []
-
-            for client_id in cluster_clients:
-                if client_id in self.uploaded_ids:
-                    idx = self.uploaded_ids.index(client_id)
-                    client_model = self.uploaded_models[idx]
-
-                    # 【FedAWA核心】计算客户端更新向量
-                    client_vector = self.compute_client_update_vector(client_model, cluster_model)
-                    if client_vector is not None:
-                        client_vectors.append(client_vector)
-                        valid_models.append(client_model)
-                        client_weights.append(self.uploaded_weights[idx])
-
-            if len(client_vectors) < 2:
-                continue
-
-            # 【FedAWA核心】基于向量对齐度计算自适应权重
-            adaptive_weights = self.compute_fedawa_weights(client_vectors)
-
-            # 应用自适应权重进行聚合
-            with torch.no_grad():
-                for key in cluster_model.state_dict().keys():
-                    if 'bn' not in key:
-                        weighted_param = torch.zeros_like(cluster_model.state_dict()[key])
-
-                        for model, weight in zip(valid_models, adaptive_weights):
-                            weighted_param += weight * model.state_dict()[key].to(self.device)
-
-                        cluster_model.state_dict()[key].data.copy_(weighted_param)
-
-    def compute_client_update_vector(self, client_model, reference_model):
-        """计算客户端更新向量（FedAWA方法）"""
-        try:
-            update_vector = []
-            with torch.no_grad():
-                for (name1, param1), (name2, param2) in zip(
-                        client_model.named_parameters(), reference_model.named_parameters()
-                ):
-                    if 'bn' not in name1:
-                        # 计算参数更新差异
-                        param_diff = param1.data - param2.data
-                        update_vector.append(param_diff.flatten())
-
-            if update_vector:
-                return torch.cat(update_vector)
-            return None
-        except:
-            return None
-
-    def compute_fedawa_weights(self, client_vectors):
-        """基于FedAWA的对齐度计算自适应权重"""
-        n_clients = len(client_vectors)
-        alignment_scores = torch.zeros(n_clients)
-
-        # 计算每个客户端与其他客户端的平均对齐度
-        for i in range(n_clients):
-            total_alignment = 0
-            for j in range(n_clients):
-                if i != j:
-                    # 余弦相似度作为对齐度
-                    cosine_sim = F.cosine_similarity(
-                        client_vectors[i].unsqueeze(0),
-                        client_vectors[j].unsqueeze(0)
-                    )
-                    total_alignment += torch.clamp(cosine_sim, -1, 1)
-
-            alignment_scores[i] = total_alignment / (n_clients - 1)
-
-        # 【FedAWA核心】将对齐度转换为权重
-        # 高对齐度获得更高权重
-        raw_weights = torch.softmax(alignment_scores, dim=0)
-
-        # 平滑处理避免权重过于极端
-        min_weight = 0.1 / n_clients
-        smoothed_weights = raw_weights * (1 - min_weight) + min_weight
-
-        return smoothed_weights.tolist()
-
-    # def aggregate_parameters_by_layer(self, layer):
-    #     """按层级聚合参数"""
-    #     if layer == 0:
-    #         # 第0层：全局聚合（原有逻辑）
-    #         self.aggregate_parameters()
-    #     else:
-    #         # 其他层：按聚类聚合
-    #         self.aggregate_parameters_by_clusters(layer)
-
-    # def aggregate_parameters_by_clusters(self, layer):
-    #     """改进的按聚类聚合参数 - 使用FedAWA自适应权重"""
-    #     if layer not in self.structure:
-    #         return
-    #
-    #     # 使用FedAWA自适应聚合
-    #     self.fedawa_adaptive_aggregation(layer)
-    #
-    #     # 记录聚合质量
-    #     self.log_aggregation_quality(layer)
-
-    def log_aggregation_quality(self, layer):
-        """记录聚合质量指标"""
-        if not hasattr(self, 'aggregation_logs'):
-            self.aggregation_logs = []
-
-        # 简单的聚合质量监控
-        quality_score = len(self.uploaded_models) / self.num_clients
-        self.aggregation_logs.append({
-            'layer': layer,
-            'quality_score': quality_score,
-            'num_clients': len(self.uploaded_models)
-        })
-
-    def freeze_current_layer_parameters(self, layer):
+    def freeze_current_layer_parameters(self, layer):   #启用
         """冻结当前层的参数"""
         if layer not in self.structure:
             print("freeze_current_layer_parameters:layer not in self.structure")
@@ -482,7 +322,7 @@ class MyMethod(FedAvg):
 
         print(f"已冻结第 {layer} 层的参数")
 
-    def update_client_performance_tracking(self):
+    def update_client_performance_tracking(self):   #启用
         """更新客户端性能跟踪"""
         # 这里使用最新的F1分数作为性能指标
         current_f1 = self.rs_test_f1[-1] if self.rs_test_f1 else 0.0
@@ -492,32 +332,10 @@ class MyMethod(FedAvg):
                 self.client_performance_history[client_id] = []
             self.client_performance_history[client_id].append(current_f1)
 
-    def update_active_clients_based_on_performance(self):
-        """基于性能更新活跃客户端"""
-        # 移除持续表现差的客户端
-        if len(self.client_performance_history) > 0:
-            avg_performance = np.mean([np.mean(scores[-3:]) if len(scores) >= 3 else np.mean(scores)
-                                       for scores in self.client_performance_history.values()])
-
-            clients_to_remove = []
-            for client_id in self.active_clients_set:
-                if client_id in self.client_performance_history:
-                    client_scores = self.client_performance_history[client_id]
-                    recent_avg = np.mean(client_scores[-3:]) if len(client_scores) >= 3 else np.mean(client_scores)
-
-                    # 如果客户端表现持续低于平均水平的70%，则移除
-                    if recent_avg < 0.7 * avg_performance and len(client_scores) >= 3:
-                        clients_to_remove.append(client_id)
-
-            for client_id in clients_to_remove:
-                self.active_clients_set.discard(client_id)
-
-            if clients_to_remove:
-                print(f"移除表现不佳的客户端: {clients_to_remove}")
 
 
 
-    def send_models_with_classifier(self, layer, clusters):
+    def send_models_with_classifier(self, layer, clusters):   #启用
         assert (len(self.clients) > 0)
         # 构建一个客户端ID到聚类ID的映射
         client_to_cluster_map = {}
@@ -533,8 +351,13 @@ class MyMethod(FedAvg):
                 print(f"警告: 客户端 {client.id} 不在当前聚类列表中。")
                 continue
             model_to_send = self.structure[layer][cluster_idx][1]
+            filtered_model_to_send = {
+                key: value
+                for key, value in model_to_send.items()
+                if "bn" not in key  # 筛选掉所有包含"bn"的参数，包括weight, bias, running_mean, running_var
+            }
             client.set_parameters_with_classifier(
-                model_to_send,  # 只发送结构信息
+                filtered_model_to_send,  # 只发送结构信息
                 self.classifier_list,
                 layer  # 传递当前层级
             )
@@ -543,128 +366,36 @@ class MyMethod(FedAvg):
 
 
 
-    def receive_models_with_classifier(self,clusters):
-        assert (len(self.selected_clients) > 0)   #使用assert确保可挑选的客户端始终大于0
 
-        active_clients = random.sample(
-            self.selected_clients, int((1-self.client_drop_rate) * self.current_num_join_clients))
+    def evaluate_clusters_in_layer(self, layer, clusters):   #启用
+        """
+        对指定层级的每个聚类模型进行评估。
+        """
+        print(f"\n--- 第 {layer} 层开始分聚类评估 ---")
+        print(f"\n--- 全局训练轮数第 {self.current_round} 轮---")
 
-        self.uploaded_models = {cluster_id: [] for cluster_id in range(len(clusters))}
-        self.uploaded_weights = {cluster_id: [] for cluster_id in range(len(clusters))}
-        self.uploaded_ids = {cluster_id: [] for cluster_id in range(len(clusters))}
-        self.classifier_list = {}
-        tot_samples = 0
-        for client in active_clients:
-            try:
-                client_time_cost = client.train_time_cost['total_cost'] / client.train_time_cost['num_rounds'] + \
-                        client.send_time_cost['total_cost'] / client.send_time_cost['num_rounds']
-            except ZeroDivisionError:
-                client_time_cost = 0
-            if client_time_cost <= self.time_threthold:
-                tot_samples += client.train_samples
-                self.uploaded_ids.append(client.id)
-                self.uploaded_weights.append(client.train_samples)
-                self.uploaded_models.append(copy.deepcopy(client.model))
-                self.classifier_list[client.id] = copy.deepcopy(client.offline_model.classifier)
-                received_model = self.uploaded_models[-1]
+        # 遍历当前层级的每个聚类
+        for cluster_id, _ in enumerate(clusters):
+            # 确保该聚类模型存在
+            if layer in self.structure and cluster_id in self.structure[layer]:
+                # 获取当前聚类的最新聚合模型参数
+                model_params = self.structure[layer][cluster_id][1]
 
+                # 将聚类模型参数加载到 self.global_model 中进行评估
+                with torch.no_grad():
+                    for key, param in model_params.items():
+                        if key in self.global_model.state_dict():
+                            self.global_model.state_dict()[key].data.copy_(param)
 
-        for i, w in enumerate(self.uploaded_weights):
-            self.uploaded_weights[i] = w / tot_samples
+                print(f"服务器: 正在评估第 {layer} 层、聚类 {cluster_id} 的模型...")
 
-        for client in active_clients:
-            client_id = client.id
+                # 执行评估，并打印结果
+                self.evaluate()
 
-            # 收集模型参数
-            if hasattr(client, 'model'):
-                params_dict = {}
-                for name, param in client.model.named_parameters():
-                    params_dict[name] = param.data.clone().detach()
-                self.client_parameters_history[client_id].append(params_dict)
-                if len(self.client_parameters_history[client_id]) > 10:
-                    self.client_parameters_history[client_id].pop(0)
-
-            # 收集训练历史
-            if hasattr(client, 'current_train_loss'):
-                training_record = {
-                    'round': getattr(self, 'current_round', 0),
-                    'loss': client.current_train_loss,
-                    'client_id': client_id
-                }
-                self.client_training_history[client_id].append(training_record)
-                if len(self.client_training_history[client_id]) > 20:
-                    self.client_training_history[client_id].pop(0)
-
-    # def aggregate_parameters(self):
-    #     """改进的参数聚合 - 使用梯度裁剪防止爆炸"""
-    #     assert (len(self.uploaded_models) > 0)
-    #
-    #     # 标准FedAvg聚合
-    #     new_global_params = self.fedavg_aggregate()
-    #
-    #     # PPO风格的参数裁剪（如果启用）
-    #     if self.ppo_enabled and self.old_global_params is not None:
-    #         new_global_params = self.ppo_clip_parameters(new_global_params)
-    #
-    #     # 更新全局模型
-    #     self.update_global_model(new_global_params)
-    #
-    #     # 保存历史参数
-    #     self.old_global_params = copy.deepcopy(new_global_params)
-
-    def fedavg_aggregate(self):
-        """改进的FedAvg聚合 - 添加数值稳定性检查"""
-        aggregated_params = {}
-        first_model = self.uploaded_models[0]
-
-        for key in first_model.state_dict().keys():
-            if 'bn' not in key and 'num_batches_tracked' not in key:
-                temp = torch.zeros_like(first_model.state_dict()[key], dtype=torch.float32)
-
-                for w, client_model in zip(self.uploaded_weights, self.uploaded_models):
-                    param_contribution = w * client_model.state_dict()[key].to(self.device)
-                    # 检查数值稳定性
-                    if torch.isnan(param_contribution).any() or torch.isinf(param_contribution).any():
-                        print(f"Warning: NaN/Inf detected in parameter {key}, skipping this client")
-                        continue
-                    temp += param_contribution
-
-                aggregated_params[key] = temp.clone()
-
-        return aggregated_params
-
-    def ppo_clip_parameters(self, new_params):
-        """改进的PPO裁剪 - 降低裁剪强度"""
-        clipped_params = {}
-        # 降低裁剪范围
-        epsilon = max(0.05, self.ppo_epsilon * 0.5)  # 原来的一半
-
-        for key in new_params.keys():
-            if key in self.old_global_params:
-                old_param = self.old_global_params[key]
-                new_param = new_params[key]
-
-                # 计算相对变化
-                param_diff = new_param - old_param
-                param_ratio = param_diff / (torch.abs(old_param) + 1e-8)
-
-                # 温和的裁剪
-                clipped_ratio = torch.clamp(param_ratio, -epsilon, epsilon)
-                clipped_params[key] = old_param + clipped_ratio * torch.abs(old_param)
-            else:
-                clipped_params[key] = new_params[key]
-
-        return clipped_params
-
-    def update_global_model(self, new_params, layer, clusters):
-        """更新全局模型参数"""
-        with torch.no_grad():
-            for key, param in new_params.items():
-                if key in self.global_model.state_dict():
-                    self.global_model.state_dict()[key].data.copy_(param)
+        print(f"--- 第 {layer} 层分聚类评估完成 ---")
 
 
-    def evaluate(self,acc=None, loss=None):
+    def evaluate(self, acc=None, loss=None):   #启用
         """
                 在服务器端使用全局测试集评估全局模型。
                 """
@@ -679,7 +410,7 @@ class MyMethod(FedAvg):
 
         test_loader = DataLoader(
             self.global_test_data,
-            batch_size=self.args.batch_size,
+            batch_size=self.batch_size,
             shuffle=False
         )
 
@@ -704,10 +435,12 @@ class MyMethod(FedAvg):
         auc = roc_auc_score(all_labels, all_preds_prob)
         auprc = average_precision_score(all_labels, all_preds_prob)
         cm = confusion_matrix(all_labels, binary_preds)
-
+        tn, fp, fn, tp = cm.ravel()
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
 
         print(f"Accuracy: {accuracy:.4f}")
         print(f"F1-Score: {f1:.4f}")
+        print(f"Recall: {recall:.4f}")
         print(f"AUC: {auc:.4f}")
         print(f"AUPRC: {auprc:.4f}")
         print("Confusion Matrix:\n", cm)
@@ -717,43 +450,14 @@ class MyMethod(FedAvg):
             'accuracy': accuracy,
             'f1_score': f1,
             'auc': auc,
-            'auprc': auprc
+            'auprc': auprc,
+            'recall': recall
         }
 
 
 
 
-    def whether_early_stop(self,score):
-        if self.best_score is None:
-            self.best_score = score
-            return
-        if self.early_stop_mode == 'max':
-            if score - self.best_score > self.min_delta:
-                old = self.best_score
-                self.best_score = score
-                self.num_bad_rounds = 0
-                print(f"Early stop monitor: improved metric from {old:.4f} to {score:.4f}")
-            else:
-                self.num_bad_rounds += 1
-                print(f"Early stop monitor: no improvement for {self.num_bad_rounds} rounds")
-        else:
-            if self.best_score - score > self.min_delta:
-                old = self.best_score
-                self.best_score = score
-                self.num_bad_rounds = 0
-                print(f"Early stop monitor: improved metric from {old:.4f} to {score:.4f}")
-            else:
-                self.num_bad_rounds += 1
-                print(f"Early stop monitor: no improvement for {self.num_bad_rounds} rounds")
-
-        if self.num_bad_rounds >= self.patience:
-            self.early_stop = True
-            print(f"Early stopping triggered after {self.num_bad_rounds} rounds without improvement")
-
-    # def init_layer(self):
-    #     self.structure[0][0] = [np.arange(self.num_clients),]
-
-    def log_round_summary(self, round_num):
+    def log_round_summary(self, round_num):   #启用
         """每轮结束的汇总信息"""
         total_anomalies = sum(
             1 for client in self.clients if hasattr(client, 'anomaly_count') and client.anomaly_count > 0)
@@ -772,7 +476,7 @@ class MyMethod(FedAvg):
             if hasattr(client, 'anomaly_count'):
                 client.anomaly_count = max(0, client.anomaly_count - 1)  # 逐渐减少计数
 
-    def plot_metrics(self):
+    def plot_metrics(self):   #启用
         """绘制所有评估指标的折线图"""
         try:
             import matplotlib.pyplot as plt
@@ -834,9 +538,8 @@ class MyMethod(FedAvg):
             print("Matplotlib or Seaborn not installed. Cannot generate plots.")
             print("Please install them with: pip install matplotlib seaborn")
 
-    def detect_fraud_gradient_conflicts(self, layer):
+    def detect_fraud_gradient_conflicts(self, layer):   #启用
         """
-        原先可能基于客户端的精确欺诈比例来检测梯度冲突。
         现在我们只使用离散等级信息，并结合梯度/更新签名来做判定。
 
         如果等级差 >= 2（即 0 vs 2），则直接标为高冲突概率；
@@ -880,84 +583,147 @@ class MyMethod(FedAvg):
 
 
 
-    def fraud_aware_layer_aggregation(self, layer, clusters):
+    def fraud_aware_layer_aggregation(self, layer, clusters):   #启用
         """
-           基于欺诈感知权重对每个聚类进行聚合，并将结果保存到 self.structure。
-           """
+        基于客户端模型的AUPRC进行加权聚合。
+        """
         if not hasattr(self, 'uploaded_models') or not self.uploaded_models:
             print("警告: 没有上传的模型数据，无法进行聚合。")
             return
 
-        # 遍历每个聚类，进行聚合
+            # 遍历每个聚类，进行聚合
         for cluster_id, uploaded_cluster_models in self.uploaded_models.items():
-            # 检查当前聚类是否有上传模型
             if not uploaded_cluster_models:
                 print(f"警告: 聚类 {cluster_id} 没有上传模型，跳过聚合。")
                 continue
 
-            # 获取当前聚类的客户端 ID 和对象
-            uploaded_client_ids = self.uploaded_ids[cluster_id]
-            cluster_clients = [self.clients[cid] for cid in uploaded_client_ids]
+            # 步骤1: 评估每个客户端模型，并计算其AUPRC加权
+            auprcs = {}
+            client_updates = []
+            total_auprc_sum = 0
 
-            # 为每个上传模型的客户端计算欺诈感知权重
-            aggregation_weights = []
-            for client in cluster_clients:
-                weight = self.compute_fraud_aware_weights(client)
-                aggregation_weights.append(weight)
+            # 获取当前聚类的全局模型参数，结构为 self.structure[layer][cluster_idx][1]
+            current_cluster_params = self.structure[layer][cluster_id][1]
 
-            total_weight = sum(aggregation_weights)
-            if total_weight > 0:
-                aggregation_weights = [w / total_weight for w in aggregation_weights]
-            else:
-                # 如果权重总和为0，则使用平均权重
-                aggregation_weights = [1.0 / len(uploaded_cluster_models)] * len(uploaded_cluster_models)
+            uploaded_cluster_ids = self.uploaded_ids[cluster_id]
 
-            # 执行加权聚合，并得到聚合后的参数字典
-            aggregated_params = self.weighted_parameter_aggregation(uploaded_cluster_models, aggregation_weights)
+            # 使用 zip 函数将模型和其对应的ID配对
+            for client_id, client_model in zip(uploaded_cluster_ids, uploaded_cluster_models):
+                # 获取模型的参数（state_dict）
+                model_params = client_model.state_dict()
 
-            # 将聚合参数应用到 self.structure 中对应的聚类模型
-            if aggregated_params:
-                with torch.no_grad():
-                    # 检查 self.structure 结构
-                    if layer not in self.structure:
-                        self.structure[layer] = {}
-                    if cluster_id not in self.structure[layer] or self.structure[layer][cluster_id][1] is None:
-                        # 如果聚类模型不存在，则初始化
-                        self.structure[layer][cluster_id] = [uploaded_client_ids, aggregated_params]
-                    else:
-                        # 更新已存在的模型参数
-                        current_cluster_params = self.structure[layer][cluster_id][1]
-                        for key, param in aggregated_params.items():
-                            if key in current_cluster_params:
-                                current_cluster_params[key].data.copy_(param)
+                # 调用 evaluate_client_model_before_aggregate 方法
+                metrics = self.evaluate_client_model_before_aggregate(model_params, cluster_id, layer)
 
-                print(f"服务器: 第 {layer} 层，聚类 {cluster_id} 模型聚合完成，并已更新。")
-                print(f"   权重分布: {[f'{w:.3f}' for w in aggregation_weights[:5]]}")
+                # 使用AUPRC作为权重，它能平衡精确率和召回率
+                weight = metrics.get('AUPRC', 0.0)
+                auprcs[client_id] = weight
+
+                total_auprc_sum += weight
+                client_updates.append((weight, model_params))
+
+            if total_auprc_sum == 0:
+                print(f"警告: 聚类 {cluster_id} 的AUPRC总和为0，无法进行聚合。请检查客户端模型的AUPRC。")
+                continue
+
+            # 初始化聚合后的模型参数
+            aggregated_params = {
+                key: torch.zeros_like(value).to(self.device)
+                for key, value in current_cluster_params.items()
+            }
+
+            # 步骤2: 执行加权聚合
+            with torch.no_grad():
+                for weight, model_params in client_updates:
+                    normalized_weight = weight / total_auprc_sum
+                    for key in aggregated_params:
+                        if key in model_params and 'bn' not in key:
+                            aggregated_params[key] += normalized_weight * model_params[key].to(self.device)
+                        elif 'bn' in key:
+                            aggregated_params[key] += current_cluster_params[key].to(self.device)
+
+                # 步骤3: 将聚合后的参数应用到全局模型中
+                for key, param in aggregated_params.items():
+                    if key in self.structure[layer][cluster_id][1]:
+                        self.structure[layer][cluster_id][1][key].data.copy_(param.cpu())
+
+            print(f"服务器: 第 {layer} 层，聚类 {cluster_id} 模型聚合完成，并已更新。")
+            client_id_list = uploaded_cluster_ids
+            print(f"   聚合权重 (AUPRC): {[f'{auprcs.get(cid, 0):.3f}' for cid in client_id_list[:5]]}")
+            # # 为每个上传模型的客户端计算欺诈感知权重
+            # aggregation_weights = []
+            # for client in cluster_clients:
+            #     weight = self.compute_fraud_aware_weights(client)
+            #     aggregation_weights.append(weight)
+            #
+            #
+            # aggregation_weights = []
+            # for client in cluster_clients:
+            #     # 直接使用客户端上传的 F1-Score 作为权重
+            #     # 注意：你需要确保客户端对象在服务器端仍然保持其状态
+            #     # 或者在上传参数时，客户端同时上传其 F1 值
+            #     if hasattr(client, 'local_f1_score'):
+            #         weight = client.local_f1_score
+            #     else:
+            #         # 如果无法获取，使用默认权重，例如 1.0
+            #         weight = 1.0
+            #
+            #     # 确保权重是正数，避免除以0
+            #     aggregation_weights.append(max(0.0, weight))
+            #
+            # total_weight = sum(aggregation_weights)
+            # if total_weight > 0:
+            #     aggregation_weights = [w / total_weight for w in aggregation_weights]
+            # else:
+            #     # 如果权重总和为0，则使用平均权重
+            #     aggregation_weights = [1.0 / len(uploaded_cluster_models)] * len(uploaded_cluster_models)
+            #
+            # # 执行加权聚合，并得到聚合后的参数字典
+            # aggregated_params = self.weighted_parameter_aggregation(uploaded_cluster_models, aggregation_weights)
+            #
+            # # 将聚合参数应用到 self.structure 中对应的聚类模型
+            # if aggregated_params:
+            #     with torch.no_grad():
+            #         # 检查 self.structure 结构
+            #         if layer not in self.structure:
+            #             self.structure[layer] = {}
+            #         if cluster_id not in self.structure[layer] or self.structure[layer][cluster_id][1] is None:
+            #             # 如果聚类模型不存在，则初始化
+            #             self.structure[layer][cluster_id] = [uploaded_client_ids, aggregated_params]
+            #         else:
+            #             # 更新已存在的模型参数
+            #             current_cluster_params = self.structure[layer][cluster_id][1]
+            #             for key, param in aggregated_params.items():
+            #                 if key in current_cluster_params:
+            #                     current_cluster_params[key].data.copy_(param)
+            #
+            #     print(f"服务器: 第 {layer} 层，聚类 {cluster_id} 模型聚合完成，并已更新。")
+            #     print(f"   权重分布: {[f'{w:.3f}' for w in aggregation_weights[:5]]}")
+
+#--------------------------------------------------↑↑↑-------------------------------------------------------
+
+    # def compute_fraud_aware_weights(self, client):
+    #     """
+    #     为聚合或为某些策略分配权重。不得使用精确样本数。
+    #     使用等级映射到权重的策略（可自定义映射或学习得到）。
+    #     返回单个浮点数权重。
+    #     """
+    #     level = self.get_client_fraud_level(client)
+    #     # 简单策略（可调整或用函数映射）
+    #     # 低欺诈 -> 普通权重
+    #     # 中等 -> 轻微增加（因为中等样本可能更具信息性）
+    #     # 高 -> 适当增加（因为高欺诈样本对模型影响力重要）
+    #     if level == 0:
+    #         return 1.0
+    #     elif level == 1:
+    #         return 1.2
+    #     elif level == 2:
+    #         return 1.5
+    #     else:
+    #         return 1.0
 
 
-
-    def compute_fraud_aware_weights(self, client):
-        """
-        为聚合或为某些策略分配权重。不得使用精确样本数。
-        使用等级映射到权重的策略（可自定义映射或学习得到）。
-        返回单个浮点数权重。
-        """
-        level = self.get_client_fraud_level(client)
-        # 简单策略（可调整或用函数映射）
-        # 低欺诈 -> 普通权重
-        # 中等 -> 轻微增加（因为中等样本可能更具信息性）
-        # 高 -> 适当增加（因为高欺诈样本对模型影响力重要）
-        if level == 0:
-            return 1.0
-        elif level == 1:
-            return 1.2
-        elif level == 2:
-            return 1.5
-        else:
-            return 1.0
-
-
-    def weighted_parameter_aggregation(self, models, weights, trim_ratio=0.2):
+    def weighted_parameter_aggregation(self, models, weights, trim_ratio=0.2):   #启用
         """
         Perform parameter aggregation with:
           - weight clipping & normalization (caller should pass normalized weights),
@@ -1009,7 +775,7 @@ class MyMethod(FedAvg):
 
         return aggregated_params  # 返回聚合后的参数
 
-    def fraud_detection_convergence_monitor(self, layer, round_idx, metrics, patience=3, min_delta=1e-4):
+    def fraud_detection_convergence_monitor(self, layer, round_idx, metrics, patience=3, min_delta=1e-4):   #启用
         # metrics: dict with 'f1','auc','recall'
         if not hasattr(self, 'layer_convergence_history'):
             self.layer_convergence_history = {}
@@ -1044,7 +810,7 @@ class MyMethod(FedAvg):
                 hist['bad_rounds'] = max(0, hist['bad_rounds'] - 1)
             return hist['bad_rounds'] >= patience
 
-    def adjust_aggregation_strategy(self, layer, mode):
+    def adjust_aggregation_strategy(self, layer, mode):   #启用
         """根据检测到的问题调整聚合策略"""
         if mode == "conflict_mode":
             # 启用欺诈感知聚合
@@ -1053,7 +819,7 @@ class MyMethod(FedAvg):
         else:
             self.fraud_aware_aggregation_enabled = False
 
-    def get_client_fraud_level(self, client):
+    def get_client_fraud_level(self, client): #启用
         """
         服务器端调用此接口以获取客户端的欺诈等级（整数），
         而不是精确的欺诈计数或比例。
@@ -1079,18 +845,33 @@ class MyMethod(FedAvg):
             return 1
 
 #--------------------------------------------------------------------------------------------------------------------------------------------------
-    def compute_gradient_similarity(self, client_updates):
+    def compute_gradient_similarity(self, client_updates):   #启用
         """计算客户端之间的梯度相似度"""
         similarities = {}
         client_ids = list(client_updates.keys())
 
+        # === 调试打印 ===
+        if not client_ids:
+            print("警告: 聚类输入为空，无法计算相似度。")
+            return {}
+        print(f"聚类输入客户端数量: {len(client_ids)}")
+        sample_client_id = client_ids[0]
+        sample_update = client_updates[sample_client_id]
+        # print(f"示例客户端 {sample_client_id} 的更新类型: {type(sample_update)}")
+        # if isinstance(sample_update, dict):
+        #     print(f"示例更新字典的键: {list(sample_update.keys())}")
+
+
         for i, client_a in enumerate(client_ids):
             similarities[client_a] = {}
-            grad_a = self.flatten_gradients(client_updates[client_a])
+            grad_a = self.flatten_param(client_updates[client_a])
+
+            # === 调试打印 ===
+            print(f"客户端 {client_a} 的展平梯度范数: {torch.norm(grad_a).item():.4f}")
 
             for j, client_b in enumerate(client_ids):
                 if i <= j:
-                    grad_b = self.flatten_gradients(client_updates[client_b])
+                    grad_b = self.flatten_param(client_updates[client_b])
                     # 使用余弦相似度
                     similarity = torch.cosine_similarity(grad_a.unsqueeze(0), grad_b.unsqueeze(0))
                     similarities[client_a][client_b] = similarity.item()
@@ -1100,25 +881,25 @@ class MyMethod(FedAvg):
 
         return similarities
 
-    def flatten_gradients(self, model_params):
-        """将模型参数展平为一维向量"""
+    def flatten_param(self, model_params):   #启用
+        """将模型参数字典展平为一维向量，并计算其范数作为梯度范数"""
         flattened = []
         for name, param in model_params.items():
-            if isinstance(param, torch.Tensor) and param.requires_grad:
-                flattened.append(param.flatten())
+            if isinstance(param, torch.Tensor):
+                # 这里的param是state_dict中的张量，没有requires_grad属性
+                flattened.append(param.flatten().to(self.device))
 
         if not flattened:
-            # 如果没有可训练参数，返回零向量
             return torch.zeros(1, device=self.device)
 
         return torch.cat(flattened)
 
-    def adaptive_layer_clustering(self, client_updates, layer_idx):
+    def adaptive_layer_clustering(self, client_updates, layer_idx):   #启用
         """自适应层级聚类"""
         similarities = self.compute_gradient_similarity(client_updates)
 
         # 根据层级调整相似度阈值
-        similarity_threshold = 0.8 - 0.1 * layer_idx  # 随层级递减
+        similarity_threshold = 0.7 - 0.1 * layer_idx  # 随层级递减
 
         client_ids = list(client_updates.keys())
         clusters = []
@@ -1142,7 +923,7 @@ class MyMethod(FedAvg):
 
         return clusters
 
-    def progressive_layer_training(self, layer_idx):
+    def progressive_layer_training(self, layer_idx):   #启用
         """渐进式层级训练，支持参数解冻"""
         if layer_idx > 0:
             # 部分解冻前一层参数，允许微调
@@ -1160,51 +941,16 @@ class MyMethod(FedAvg):
                 param.requires_grad = True
                 param.lr_scale = 1.0
 
-    def collect_client_updates(self):
+    def collect_client_updates(self):   #启用
         """收集客户端模型更新用于聚类分析"""
         updates = {}
-        for client in self.selected_clients:
-            updates[client.id] = {}
-            for name, param in client.model.named_parameters():
-                if param.requires_grad:
-                    updates[client.id][name] = param.data.clone()
+        for client in self.clients:
+            updates[client.id] = client.latest_model_params
         return updates
 
-    def train_cluster_clients(self, cluster_clients, layer_idx, round_idx,alpha):
-        """训练聚类内的客户端"""
-        for client in cluster_clients:
-            # 设置自适应学习率
-            adaptive_lr = client.get_adaptive_lr()
-            for param_group in client.optimizer.param_groups:
-                param_group['lr'] = adaptive_lr
-            print(f"客户端 {client.id}: 自适应学习率 {adaptive_lr:.6f}")
 
-            client_alpha = alpha[client.id]
-            # 训练客户端
-            client.train_layer_specific(layer_idx, round_idx, len(cluster_clients), client_alpha)
 
-            # 更新学习率历史信息
-            training_loss = getattr(client, 'training_loss', 1.0)
-            global_loss = getattr(self, 'global_loss', 1.0)
-            client.update_lr_history(training_loss, global_loss, round_idx)
-
-    def aggregate_cluster(self, models, clients):
-        """聚合聚类内的模型更新"""
-        # 使用FedAvg方式聚合
-        global_dict = self.global_model.state_dict()
-
-        for key in global_dict.keys():
-            if any(key in model.state_dict() for model in models):
-                global_dict[key] = torch.stack([
-                    model.state_dict()[key] * (len(client.train_samples) /
-                                               sum(len(c.train_samples) for c in clients))
-                    for model, client in zip(models, clients)
-                    if key in model.state_dict()
-                ]).sum(0)
-
-        self.global_model.load_state_dict(global_dict)
-
-    def compute_adaptive_alpha(self, noisy_client_ratios):
+    def compute_adaptive_alpha(self, noisy_client_ratios):   #启用
         """
         根据客户端报告的带噪比例，计算每个客户端的自适应alpha值。
         """
@@ -1221,7 +967,7 @@ class MyMethod(FedAvg):
 
         return alphas
 
-    def get_noisy_pos_ratios(self, clients): # 接收客户端对象列表
+    def get_noisy_pos_ratios(self, clients): # 接收客户端对象列表    #启用
         """
         向指定的客户端请求其带噪的正样本比例。
         """
@@ -1234,4 +980,44 @@ class MyMethod(FedAvg):
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------
 
+    def evaluate_client_model_before_aggregate(self, model_params, cluster_id, layer):
+        """
+        使用服务器的本地验证集对客户端模型进行评估。
+        """
+        temp_model = copy.deepcopy(self.global_model)
 
+        # 加载客户端的参数
+        temp_model.load_state_dict(model_params)
+        temp_model.to(self.device)
+        temp_model.eval()
+
+        # 获取该聚类的验证数据加载器
+        test_loader = DataLoader(
+            self.global_test_data,
+            batch_size=self.batch_size,
+            shuffle=False
+        )
+
+        y_true = []
+        y_pred_probs = []
+
+        with torch.no_grad():
+            for i, (inputs, labels) in enumerate(test_loader):
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                outputs = temp_model(inputs)
+
+                probs = torch.sigmoid(outputs)
+
+                y_true.extend(labels.cpu().numpy())
+                y_pred_probs.extend(probs.cpu().numpy())
+
+        # 计算评估指标
+        y_pred = (np.array(y_pred_probs) > 0.5).astype(int)
+        metrics = {}
+        metrics['Accuracy'] = accuracy_score(y_true, y_pred)
+        metrics['F1-Score'] = f1_score(y_true, y_pred, zero_division=0)
+        metrics['Recall'] = recall_score(y_true, y_pred, zero_division=0)
+        # 核心：计算AUPRC，它将作为聚合权重
+        metrics['AUPRC'] = average_precision_score(y_true, y_pred_probs)
+
+        return metrics
