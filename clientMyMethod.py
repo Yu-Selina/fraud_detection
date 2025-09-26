@@ -18,6 +18,7 @@ from imblearn.over_sampling import SMOTE
 from collections import Counter
 from imblearn.over_sampling import SMOTE, RandomOverSampler
 from sklearn.metrics import f1_score
+from sklearn.metrics import average_precision_score
 
 class clientMyMethod(clientAVG):
     def __init__(self, args, id, train_samples, test_samples, **kwargs):
@@ -115,20 +116,20 @@ class clientMyMethod(clientAVG):
 
         labels_resampled_for_pos_weight = []
 
-        if fraud_count > 0:
-            # 根据原始数据计算 pos_weight
-            stable_pos_weight = torch.tensor(normal_count / fraud_count).to(self.device)
-        else:
-            stable_pos_weight = torch.tensor(1.0).to(self.device)
-
-        # 然后再对数据进行 SMOTE
-        # self.train_data = smote(self.train_data) # MOTE 调用
-        stable_pos_weight = torch.clamp(stable_pos_weight, min=1.0, max=5.0)
-        # 将 pos_weight 传给损失函数
-        # local_criterion = nn.BCEWithLogitsLoss(pos_weight=stable_pos_weight)
-        offline_criterion = nn.BCEWithLogitsLoss(pos_weight=stable_pos_weight)
-        online_criterion = nn.BCEWithLogitsLoss()
-        print(f"客户端 {self.id}: 本地训练，根据原始数据计算出的 pos_weight 值为: {stable_pos_weight.item():.2f}")
+        # if fraud_count > 0:
+        #     # 根据原始数据计算 pos_weight
+        #     stable_pos_weight = torch.tensor(normal_count / fraud_count).to(self.device)
+        # else:
+        #     stable_pos_weight = torch.tensor(1.0).to(self.device)
+        #
+        # # 然后再对数据进行 SMOTE
+        # # self.train_data = smote(self.train_data) # MOTE 调用
+        # stable_pos_weight = torch.clamp(stable_pos_weight, min=1.0, max=5.0)
+        # # 将 pos_weight 传给损失函数
+        # # local_criterion = nn.BCEWithLogitsLoss(pos_weight=stable_pos_weight)
+        # offline_criterion = nn.BCEWithLogitsLoss(pos_weight=stable_pos_weight)
+        # online_criterion = nn.BCEWithLogitsLoss()
+        # print(f"客户端 {self.id}: 本地训练，根据原始数据计算出的 pos_weight 值为: {stable_pos_weight.item():.2f}")
 
 
         # 欺诈与非欺诈不一样就用 SMOTE
@@ -160,7 +161,7 @@ class clientMyMethod(clientAVG):
                     # 执行数据增强
                     features_resampled, labels_resampled = sampler.fit_resample(features, labels)
                     #打印新的样本分布，以便调试
-                    print(f"客户端 {self.id}: 增强后欺诈样本数量：{Counter(labels_resampled)[1]}，正常样本数量：{Counter(labels_resampled)[0]}")
+                    # print(f"客户端 {self.id}: 增强后欺诈样本数量：{Counter(labels_resampled)[1]}，正常样本数量：{Counter(labels_resampled)[0]}")
 
                     labels_resampled_for_pos_weight = labels_resampled
 
@@ -271,8 +272,8 @@ class clientMyMethod(clientAVG):
                 if teacher_output.dim() > 1:
                     teacher_output = teacher_output.squeeze()
 
-                local_train_online_loss = online_criterion(teacher_output, y)
-                local_train_offline_loss = offline_criterion(student_output, y)
+                local_train_online_loss = self.focal_loss(teacher_output, y, alpha=0.5, gamma=3, model_type='online')
+                local_train_offline_loss = self.focal_loss(student_output, y, alpha=0.25, gamma=2, model_type='offline')
 
                 if torch.isnan(local_train_online_loss).any() or torch.isinf(local_train_online_loss).any():
                     print(f"警告：客户端 {self.id}，轮次 {round_idx}，本地训练第 {epoch} 轮，online_loss 包含 NaN/Inf！")
@@ -450,6 +451,33 @@ class clientMyMethod(clientAVG):
             'num_samples': self.train_samples
         }
 
+    def focal_loss(self,inputs, targets, alpha=0.25, gamma=2, reduction='mean', model_type='online'):
+        """
+        Focal Loss for binary classification.
+        :param inputs: Model outputs (logits)
+        :param targets: True labels (0 or 1)
+        :param alpha: Class balancing factor for positive class
+        :param gamma: Focusing parameter to down-weight easy examples
+        :param reduction: 'mean' or 'sum', specifies the reduction to apply
+        :param model_type: 'online' or 'offline' to distinguish between local and global models
+        :return: Computed focal loss value
+        """
+        # Binary Cross-Entropy loss
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+
+        # Calculate pt (probability predicted by model)
+        pt = torch.exp(-bce_loss)
+
+        # Apply Focal Loss
+        focal_loss_value = alpha * (1 - pt) ** gamma * bce_loss
+
+        # Apply reduction (mean or sum)
+        if reduction == 'mean':
+            return focal_loss_value.mean()
+        elif reduction == 'sum':
+            return focal_loss_value.sum()
+        else:
+            return focal_loss_value
 
 
     def set_parameters_with_classifier(self, global_structure, classifier_list, layer):
@@ -585,45 +613,43 @@ class clientMyMethod(clientAVG):
 
     def compute_kd_loss(self,teacher_logits, student_logits, labels, alpha):
         """
-        teacher_logits, student_logits: raw logits (not sigmoid applied), shape (B,) or (B,1)
-        labels: optional ground-truth (0/1) for CE term
-        alpha: weight for CE_with_labels (student supervised)
-        beta: 1-alpha for KD (teacher->student)
-        temperature: T
-        """
-        T = self.temperature
-        # ensure shape (B,1)
+           计算带温度系数的蒸馏损失。
+           :param teacher_logits: 教师模型的 logits（未经 sigmoid 处理）
+           :param student_logits: 学生模型的 logits（未经 sigmoid 处理）
+           :param labels: 真实标签（用于 CE 损失）
+           :param alpha: 权重，控制 CE 损失和 KD 损失的比例
+           """
+        T = self.temperature  # 温度系数
+        # 保证 logits 形状为 (B,1)
         if teacher_logits.dim() == 1:
             teacher_logits = teacher_logits.unsqueeze(1)
         if student_logits.dim() == 1:
             student_logits = student_logits.unsqueeze(1)
 
-        # supervised loss for student (use BCEWithLogits for numerical stability)
+        # 学生模型的监督损失（交叉熵）
         ce_loss = torch.tensor(0.0, device=student_logits.device)
         if labels is not None:
             labels = labels.float().unsqueeze(1)
             ce_loss = F.binary_cross_entropy_with_logits(student_logits, labels)
 
-        # KD loss: KL between teacher_soft and student_soft
-        # For binary case, use softmax on two logits [logit, 0] or apply sigmoid then transform?
-        # Simpler robust approach: treat logits as 2-class logits: [logit, 0]
-
-
+        # KD 损失：教师模型的软目标与学生模型的软目标之间的 KL 散度
         t2 = self.to_2class_logits(teacher_logits) / T
         s2 = self.to_2class_logits(student_logits) / T
 
-        # compute soft targets and student log-probs
+        # 计算教师的 softmax 输出和学生的 log-softmax
         p_teacher = F.softmax(t2, dim=1)
         log_p_student = F.log_softmax(s2, dim=1)
 
-        # KLDiv expects input = log-probs, target = probs
+        # KL 散度
         kd_loss = F.kl_div(log_p_student, p_teacher, reduction='batchmean') * (T * T)
 
+        # 加权比例
         alpha_val = alpha
         beta_val = 1.0 - alpha_val
 
-        total = alpha_val * ce_loss + beta_val * kd_loss
-        return total, ce_loss.detach() if labels is not None else None, kd_loss.detach()
+        # 总损失（加权交叉熵损失和 KD 损失）
+        total_loss = alpha_val * ce_loss + beta_val * kd_loss
+        return total_loss, ce_loss.detach() if labels is not None else None, kd_loss.detach()
 
     def to_2class_logits(self,x):
         return torch.cat([x, torch.zeros_like(x)], dim=1)  # shape (B,2)
@@ -803,5 +829,18 @@ class clientMyMethod(clientAVG):
         print("警告: 客户端无法找到公共验证集，基于性能的聚合将退化为平均聚合。")
         return None
 
+    def get_sample_weight(self, labels, student_output):
+        """
+        根据 AUPRC 计算样本权重。
+        :param labels: 真实标签
+        :param student_output: 模型输出（通常是概率值）
+        :return: 样本权重（基于 AUPRC）
+        """
+        # 计算 AUPRC（平均精度得分）
+        auprc = average_precision_score(labels.cpu().numpy(), student_output.cpu().detach().numpy())
 
+        # 基于 AUPRC 计算样本的权重（可以调整公式）
+        weight = auprc  # 你可以根据需求进一步调整公式
+
+        return weight
 # ----------------------------------------------------------------------------------------------------------------

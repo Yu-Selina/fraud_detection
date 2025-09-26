@@ -171,7 +171,7 @@ class MyMethod(FedAvg):
                 conflict_detected = self.detect_fraud_gradient_conflicts(layer)
                 if conflict_detected:
                     self.adjust_aggregation_strategy(layer, "conflict_mode")
-                    print(f"第 {layer} 层检测到梯度冲突，调整聚合策略")
+                    # print(f"第 {layer} 层检测到梯度冲突，调整聚合策略")
 
             # 客户端训练
             self.uploaded_models = {cluster_id: [] for cluster_id in range(len(clusters))}
@@ -609,7 +609,7 @@ class MyMethod(FedAvg):
             # 用于平滑的全局先验（例如全局验证集的AUPRC）
             global_ap_prior = 0.1
             k = 50  # 平滑强度
-            lam = 0.5  # 样本数融合比例
+            lam = 0.2  # 样本数融合比例
 
 
 
@@ -627,9 +627,10 @@ class MyMethod(FedAvg):
 
                 # 平滑后的 AUPRC
                 ap_smooth = (raw_auprc * n_samples + global_ap_prior * k) / (n_samples + k)
+                n_samples_norm = self.normalize_sample_weight(uploaded_cluster_ids, self.uploaded_weights, n_samples)
 
                 # 融合样本数的权重
-                weight = lam * n_samples + (1 - lam) * ap_smooth
+                weight = lam * n_samples_norm + (1 - lam) * ap_smooth
 
                 auprcs[client_id] = weight
                 total_weight_sum += weight
@@ -658,7 +659,7 @@ class MyMethod(FedAvg):
 
             print(f"服务器: 第 {layer} 层，聚类 {cluster_id} 模型聚合完成，并已更新。")
             client_id_list = uploaded_cluster_ids
-            print(f"   聚合权重 (平滑+样本融合): {[f'{auprcs.get(cid, 0):.3f}' for cid in client_id_list[:5]]}")
+            print(f"   聚合权重 (平滑+样本融合): {[f'{auprcs.get(cid, 0):.3f}' for cid in client_id_list[:20]]}")
 
         # # 为每个上传模型的客户端计算欺诈感知权重
             # aggregation_weights = []
@@ -909,7 +910,8 @@ class MyMethod(FedAvg):
         similarities = self.compute_gradient_similarity(client_updates)
 
         # 根据层级调整相似度阈值
-        similarity_threshold = 0.7 - 0.1 * layer_idx  # 随层级递减
+        # similarity_threshold = 0.7 - 0.1 * layer_idx  # 随层级递减
+        similarity_threshold = 0.5  # 使用固定阈值或其他动态调整逻辑
 
         client_ids = list(client_updates.keys())
         clusters = []
@@ -1058,3 +1060,22 @@ class MyMethod(FedAvg):
             metrics['NumSamples'] = len(y_true)
             print("evaluate_client_model_before_aggregate:try except wrong!")
         return metrics
+
+    def normalize_sample_weight(self,uploaded_cluster_ids, uploaded_weights, n_samples):
+        """
+        Normalizes the sample weight based on the maximum sample size in the cluster.
+        :param uploaded_cluster_ids: List of client IDs in the current cluster
+        :param uploaded_weights: Dictionary containing the sample size (train_samples) of each client
+        :param n_samples: Number of samples for the current client
+        :return: Normalized weight for the client
+        """
+        cluster_weights = uploaded_weights.get(0, [])  # 获取聚类 0 中的客户端样本数列表
+
+        if not cluster_weights:
+            raise ValueError("上传的聚类样本数为空，无法计算最大样本数！")
+
+        max_n_samples = max(cluster_weights)  # 获取当前聚类中最大样本数
+
+        # 对样本数进行归一化处理
+        n_samples_norm = n_samples / max_n_samples
+        return n_samples_norm
